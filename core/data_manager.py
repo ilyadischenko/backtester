@@ -1,6 +1,4 @@
-# core/s3_client.py
-import gzip
-import os
+
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
