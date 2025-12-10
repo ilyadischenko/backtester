@@ -1,7 +1,7 @@
 import polars as pl
 import plotly.graph_objects as go
 import numpy as np
-from data_manager import dataManager
+from core.data.data_manager import dataManager
 
 # 1. Допустим, df_pl - это твой Polars DataFrame
 # (Этот блок для примера, удали его и используй свой df)
