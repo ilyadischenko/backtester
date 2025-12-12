@@ -1,10 +1,13 @@
 # visualizer.py
 from bokeh.plotting import figure, show, output_file
-from bokeh.models import ColumnDataSource, HoverTool, Span, Segment
-from bokeh.layouts import column
+from bokeh.models import (
+    ColumnDataSource, HoverTool, Span, LabelSet, CustomJS, Button, Div
+)
+from bokeh.layouts import column, row
+from bokeh.events import Tap
 import pandas as pd
 
-from engine import ExchangeEngine
+from core.engine import ExchangeEngine
 
 
 class BacktestVisualizer:
@@ -62,9 +65,14 @@ class BacktestVisualizer:
             )
 
         # ══════════════════════════════════════════════════════
-        # НОВОЕ: Отображение позиций
+        # Отображение позиций
         # ══════════════════════════════════════════════════════
         self._draw_positions(p)
+
+        # ══════════════════════════════════════════════════════
+        # НОВОЕ: Инструмент "Линейка"
+        # ══════════════════════════════════════════════════════
+        ruler_controls = self._add_ruler_tool(p, pdf)
 
         hover_price = HoverTool(tooltips=[
             ("Time", "@time{%F %T}"),
@@ -124,7 +132,290 @@ class BacktestVisualizer:
         self._print_stats()
 
         output_file("backtest_chart.html")
-        show(column(p, p_equity, sizing_mode="stretch_width"))
+
+        # Компонуем с панелью управления линейкой
+        show(column(ruler_controls, p, p_equity, sizing_mode="stretch_width"))
+
+    def _add_ruler_tool(self, fig, price_df):
+        """
+        Добавляет инструмент "Линейка" для измерения процентного движения.
+
+        Использование:
+        1. Нажмите кнопку "📏 Линейка"
+        2. Кликните на начальную точку
+        3. Кликните на конечную точку
+        4. Увидите измерение (%, цена, время)
+        5. "Очистить" удаляет все линейки
+        """
+
+        # Источники данных для линейки
+        # Точки линейки
+        ruler_points_source = ColumnDataSource(data={
+            'x': [], 'y': [], 'color': []
+        })
+
+        # Линии линейки (сегменты)
+        ruler_lines_source = ColumnDataSource(data={
+            'x0': [], 'y0': [], 'x1': [], 'y1': [], 'color': []
+        })
+
+        # Лейблы с информацией
+        ruler_labels_source = ColumnDataSource(data={
+            'x': [], 'y': [], 'text': []
+        })
+
+        # Вспомогательные линии (вертикальная и горизонтальная)
+        ruler_helper_source = ColumnDataSource(data={
+            'x0': [], 'y0': [], 'x1': [], 'y1': []
+        })
+
+        # Рисуем элементы линейки
+        # Точки
+        fig.scatter(
+            x='x', y='y', source=ruler_points_source,
+            size=10, color='color', alpha=0.9,
+            marker='circle'
+        )
+
+        # Основная линия
+        fig.segment(
+            x0='x0', y0='y0', x1='x1', y1='y1',
+            source=ruler_lines_source,
+            line_width=2, color='color', alpha=0.9
+        )
+
+        # Вспомогательные пунктирные линии
+        fig.segment(
+            x0='x0', y0='y0', x1='x1', y1='y1',
+            source=ruler_helper_source,
+            line_width=1, color='#888888', alpha=0.6,
+            line_dash='dashed'
+        )
+
+        # Лейблы
+        labels = LabelSet(
+            x='x', y='y', text='text',
+            source=ruler_labels_source,
+            text_font_size='11pt',
+            text_color='white',
+            background_fill_color='#1e1e1e',
+            background_fill_alpha=0.85,
+            border_line_color='#ff9800',
+            border_line_width=1,
+            x_offset=10, y_offset=5
+        )
+        fig.add_layout(labels)
+
+        # Состояние линейки (хранится в скрытом источнике)
+        state_source = ColumnDataSource(data={
+            'active': [False],
+            'first_click': [False],
+            'start_x': [0],
+            'start_y': [0]
+        })
+
+        # Информационный div
+        info_div = Div(
+            text='<span style="color: #888; font-size: 12px;">📏 Линейка: выключена</span>',
+            width=400,
+            height=30,
+            styles={'margin-left': '10px'}
+        )
+
+        # Кнопки управления
+        ruler_button = Button(
+            label="📏 Линейка",
+            button_type="default",
+            width=120
+        )
+
+        clear_button = Button(
+            label="🗑 Очистить",
+            button_type="warning",
+            width=100
+        )
+
+        # JavaScript для переключения режима линейки
+        toggle_ruler_js = CustomJS(args=dict(
+            state=state_source,
+            btn=ruler_button,
+            info=info_div
+        ), code="""
+            const active = !state.data['active'][0];
+            state.data['active'][0] = active;
+            state.data['first_click'][0] = false;
+
+            if (active) {
+                btn.button_type = 'success';
+                btn.label = '📏 Линейка (ВКЛ)';
+                info.text = '<span style="color: #ff9800; font-size: 12px;">📏 Кликните на начальную точку</span>';
+            } else {
+                btn.button_type = 'default';
+                btn.label = '📏 Линейка';
+                info.text = '<span style="color: #888; font-size: 12px;">📏 Линейка: выключена</span>';
+            }
+            state.change.emit();
+        """)
+        ruler_button.js_on_click(toggle_ruler_js)
+
+        # JavaScript для очистки линеек
+        clear_ruler_js = CustomJS(args=dict(
+            points=ruler_points_source,
+            lines=ruler_lines_source,
+            labels=ruler_labels_source,
+            helpers=ruler_helper_source,
+            state=state_source,
+            btn=ruler_button,
+            info=info_div
+        ), code="""
+            points.data = {'x': [], 'y': [], 'color': []};
+            lines.data = {'x0': [], 'y0': [], 'x1': [], 'y1': [], 'color': []};
+            labels.data = {'x': [], 'y': [], 'text': []};
+            helpers.data = {'x0': [], 'y0': [], 'x1': [], 'y1': []};
+
+            state.data['active'][0] = false;
+            state.data['first_click'][0] = false;
+
+            btn.button_type = 'default';
+            btn.label = '📏 Линейка';
+            info.text = '<span style="color: #4caf50; font-size: 12px;">✓ Линейки очищены</span>';
+
+            points.change.emit();
+            lines.change.emit();
+            labels.change.emit();
+            helpers.change.emit();
+            state.change.emit();
+        """)
+        clear_button.js_on_click(clear_ruler_js)
+
+        # JavaScript для обработки кликов на графике
+        tap_callback = CustomJS(args=dict(
+            state=state_source,
+            points=ruler_points_source,
+            lines=ruler_lines_source,
+            labels=ruler_labels_source,
+            helpers=ruler_helper_source,
+            info=info_div,
+            btn=ruler_button
+        ), code="""
+            if (!state.data['active'][0]) return;
+
+            const x = cb_obj.x;
+            const y = cb_obj.y;
+
+            if (!state.data['first_click'][0]) {
+                // Первый клик - начальная точка
+                state.data['first_click'][0] = true;
+                state.data['start_x'][0] = x;
+                state.data['start_y'][0] = y;
+
+                // Добавляем начальную точку
+                points.data['x'].push(x);
+                points.data['y'].push(y);
+                points.data['color'].push('#ff9800');
+
+                info.text = '<span style="color: #ff9800; font-size: 12px;">📏 Кликните на конечную точку</span>';
+
+                points.change.emit();
+                state.change.emit();
+            } else {
+                // Второй клик - конечная точка
+                const start_x = state.data['start_x'][0];
+                const start_y = state.data['start_y'][0];
+
+                // Расчёты
+                const price_diff = y - start_y;
+                const percent_change = ((y - start_y) / start_y) * 100;
+                const is_positive = price_diff >= 0;
+                const color = is_positive ? '#00e676' : '#ff5252';
+
+                // Время
+                const start_date = new Date(start_x);
+                const end_date = new Date(x);
+                const time_diff_ms = Math.abs(x - start_x);
+                const time_diff_hours = time_diff_ms / (1000 * 60 * 60);
+
+                let time_str;
+                if (time_diff_hours < 1) {
+                    time_str = Math.round(time_diff_hours * 60) + ' мин';
+                } else if (time_diff_hours < 24) {
+                    time_str = time_diff_hours.toFixed(1) + ' ч';
+                } else {
+                    time_str = (time_diff_hours / 24).toFixed(1) + ' дн';
+                }
+
+                // Добавляем конечную точку
+                points.data['x'].push(x);
+                points.data['y'].push(y);
+                points.data['color'].push(color);
+
+                // Добавляем основную линию
+                lines.data['x0'].push(start_x);
+                lines.data['y0'].push(start_y);
+                lines.data['x1'].push(x);
+                lines.data['y1'].push(y);
+                lines.data['color'].push(color);
+
+                // Вспомогательные линии (горизонтальная и вертикальная)
+                // Горизонтальная от start до x на уровне start_y
+                helpers.data['x0'].push(start_x);
+                helpers.data['y0'].push(start_y);
+                helpers.data['x1'].push(x);
+                helpers.data['y1'].push(start_y);
+
+                // Вертикальная от start_y до y на x
+                helpers.data['x0'].push(x);
+                helpers.data['y0'].push(start_y);
+                helpers.data['x1'].push(x);
+                helpers.data['y1'].push(y);
+
+                // Форматируем цену
+                const format_price = (p) => {
+                    if (Math.abs(p) >= 1000) return p.toFixed(2);
+                    if (Math.abs(p) >= 1) return p.toFixed(4);
+                    return p.toFixed(6);
+                };
+
+                // Лейбл с информацией
+                const sign = is_positive ? '+' : '';
+                const label_text = sign + percent_change.toFixed(2) + '% | ' + 
+                                   sign + format_price(price_diff) + ' | ' + 
+                                   time_str;
+
+                labels.data['x'].push((start_x + x) / 2);
+                labels.data['y'].push((start_y + y) / 2);
+                labels.data['text'].push(label_text);
+
+                // Сброс состояния
+                state.data['first_click'][0] = false;
+                state.data['active'][0] = false;
+
+                btn.button_type = 'default';
+                btn.label = '📏 Линейка';
+
+                const result_color = is_positive ? '#00e676' : '#ff5252';
+                info.text = '<span style="color: ' + result_color + '; font-size: 12px;">📏 ' + label_text + '</span>';
+
+                points.change.emit();
+                lines.change.emit();
+                labels.change.emit();
+                helpers.change.emit();
+                state.change.emit();
+            }
+        """)
+
+        fig.js_on_event(Tap, tap_callback)
+
+        # Панель управления
+        controls = row(
+            ruler_button,
+            clear_button,
+            info_div,
+            sizing_mode="stretch_width",
+            styles={'background-color': '#1e1e1e', 'padding': '10px'}
+        )
+
+        return controls
 
     def _get_trades(self):
         """Сделки из движка."""
@@ -150,25 +441,20 @@ class BacktestVisualizer:
     def _draw_positions(self, fig):
         """
         Рисует горизонтальные линии для каждой позиции.
-        Линия показывает среднюю цену входа и тянется от открытия до закрытия.
-        При усреднении линия меняет уровень.
         """
         for position in self.engine.positions:
             segments = self._build_position_segments(position)
-            
+
             if not segments:
                 continue
-            
-            # Определяем цвет по направлению позиции
-            # Long = зелёный, Short = красный
+
             color = "#00bcd4" if position.size >= 0 else "#ff9800"
-            
+
             for segment in segments:
                 x0 = pd.to_datetime(segment['start_time'], unit='ms')
                 x1 = pd.to_datetime(segment['end_time'], unit='ms')
                 y = segment['price']
-                
-                # Рисуем сегмент линии
+
                 fig.segment(
                     x0=x0, y0=y, x1=x1, y1=y,
                     line_width=2, color=color, alpha=0.7,
@@ -178,70 +464,55 @@ class BacktestVisualizer:
     def _build_position_segments(self, position):
         """
         Строит сегменты горизонтальных линий для позиции.
-        Каждый сегмент = период с одной средней ценой входа.
-        
-        Returns: list of {'start_time', 'end_time', 'price'}
         """
-        # Получаем все ордера позиции, отсортированные по времени
         position_orders = [
-            o for o in self.engine.orders 
+            o for o in self.engine.orders
             if o.id in position.order_ids and o.status == "filled"
         ]
         position_orders.sort(key=lambda o: o.fill_time)
-        
+
         if not position_orders:
             return []
-        
+
         segments = []
-        
-        # Симулируем изменение позиции по каждому ордеру
         current_size = 0.0
         current_price = 0.0
         segment_start_time = position_orders[0].fill_time
-        
+
         for i, order in enumerate(position_orders):
             old_size = abs(current_size)
             trade_size = order.size
             trade_abs = abs(trade_size)
-            
-            # Если позиция пустая — это первый вход
+
             if abs(current_size) < 1e-12:
                 current_size = trade_size
                 current_price = order.fill_price
                 segment_start_time = order.fill_time
                 continue
-            
-            # Та же сторона — усреднение
+
             if current_size * trade_size > 0:
-                # Сохраняем старый сегмент
                 segments.append({
                     'start_time': segment_start_time,
                     'end_time': order.fill_time,
                     'price': current_price
                 })
-                
-                # Пересчитываем среднюю
+
                 old_notional = old_size * current_price
                 new_notional = trade_abs * order.fill_price
                 total_size = old_size + trade_abs
-                
+
                 current_price = (old_notional + new_notional) / total_size
                 current_size += trade_size
                 segment_start_time = order.fill_time
                 continue
-            
-            # Противоположная сторона — закрытие или переворот
+
             closed_qty = min(old_size, trade_abs)
-            
-            # Частичное закрытие
+
             if trade_abs < old_size - 1e-12:
                 current_size += trade_size
-                # Цена не меняется
                 continue
-            
-            # Полное закрытие
+
             if abs(trade_abs - old_size) < 1e-12:
-                # Завершаем последний сегмент
                 segments.append({
                     'start_time': segment_start_time,
                     'end_time': order.fill_time,
@@ -250,23 +521,19 @@ class BacktestVisualizer:
                 current_size = 0.0
                 current_price = 0.0
                 continue
-            
-            # Переворот — закрываем старую, начинаем новую
+
             remaining = trade_abs - old_size
-            
-            # Завершаем сегмент закрываемой позиции
+
             segments.append({
                 'start_time': segment_start_time,
                 'end_time': order.fill_time,
                 'price': current_price
             })
-            
-            # Открываем новую позицию
+
             current_size = trade_size / abs(trade_size) * remaining
             current_price = order.fill_price
             segment_start_time = order.fill_time
-        
-        # Если позиция всё ещё открыта — добавляем последний сегмент до конца
+
         if abs(current_size) > 1e-12:
             end_time = position.close_time if position.status == "closed" else self.engine.last_event_time
             segments.append({
@@ -274,17 +541,12 @@ class BacktestVisualizer:
                 'end_time': end_time,
                 'price': current_price
             })
-        
+
         return segments
 
     def _build_equity_curve(self):
         """
-        Строим equity curve: отслеживаем баланс после каждой сделки.
-        
-        Логика:
-        1. Каждый fill меняет позицию
-        2. После fill считаем текущий PnL всех позиций
-        3. Equity = initial_balance + sum(закрытые позиции) + unrealized(открытой)
+        Строим equity curve.
         """
         initial_balance = self.engine.strategy.initial_balance if self.engine.strategy else 0
 
@@ -295,46 +557,37 @@ class BacktestVisualizer:
             return pd.DataFrame()
 
         points = []
-        
-        # Кэш цен для расчёта unrealized PnL
         price_cache = self._build_price_cache()
-        
+
         for order in filled_orders:
             timestamp = order.fill_time
-            
-            # 1. Суммируем PnL всех ЗАКРЫТЫХ позиций на момент timestamp
+
             closed_pnl = sum(
-                p.net_pnl for p in self.engine.positions 
+                p.net_pnl for p in self.engine.positions
                 if p.status == "closed" and p.close_time <= timestamp
             )
-            
-            # 2. Находим ОТКРЫТУЮ позицию на момент timestamp
+
             open_position = None
             for pos in self.engine.positions:
                 if pos.status == "open" or (pos.status == "closed" and pos.close_time > timestamp):
-                    # Позиция открыта на момент timestamp
                     if pos.open_time <= timestamp:
                         open_position = pos
                         break
-            
-            # 3. Считаем unrealized PnL открытой позиции
+
             unrealized_pnl = 0.0
             if open_position and open_position.size != 0:
-                # Получаем bid/ask на момент timestamp
                 bid, ask = price_cache.get(timestamp, (None, None))
-                
+
                 if bid and ask:
-                    if open_position.size > 0:  # Long
+                    if open_position.size > 0:
                         mark_price = bid
                         unrealized_gross = (mark_price - open_position.price) * open_position.size
-                    else:  # Short
+                    else:
                         mark_price = ask
                         unrealized_gross = (open_position.price - mark_price) * abs(open_position.size)
-                    
-                    # Вычитаем накопленные комиссии
+
                     unrealized_pnl = unrealized_gross - open_position.fees
-            
-            # 4. Итоговый equity
+
             equity = initial_balance + closed_pnl + unrealized_pnl
 
             points.append({
@@ -346,19 +599,17 @@ class BacktestVisualizer:
 
     def _build_price_cache(self):
         """
-        Строим кэш bid/ask цен для каждого timestamp.
-        Возвращает dict: {timestamp: (bid, ask)}
+        Строим кэш bid/ask цен.
         """
         cache = {}
-        
-        # Проходим по всем bookticker событиям
+
         for event in self.engine.events.to_dicts():
             if event.get("event_type") == "bookticker":
                 timestamp = event["event_time"]
                 bid = event.get("bid_price")
                 ask = event.get("ask_price")
                 cache[timestamp] = (bid, ask)
-        
+
         return cache
 
     def _apply_dark_theme(self, fig):
@@ -372,37 +623,32 @@ class BacktestVisualizer:
         fig.grid.grid_line_alpha = 0.3
 
     def _print_stats(self):
-        """Статистика — всё из движка."""
+        """Статистика."""
         filled = [o for o in self.engine.orders if o.status == "filled"]
         buys = [o for o in filled if o.size > 0]
         sells = [o for o in filled if o.size < 0]
 
-        # Объёмы
         buy_volume_usd = sum(abs(o.size) * o.fill_price for o in buys)
         sell_volume_usd = sum(abs(o.size) * o.fill_price for o in sells)
         total_volume_usd = buy_volume_usd + sell_volume_usd
 
-        # Из движка
         realized_pnl = self.engine.get_realized_pnl()
         total_fees = self.engine.get_total_fees()
         net_pnl_closed = self.engine.get_net_pnl()
-        
-        # Для открытой позиции (если есть)
+
         open_positions = [p for p in self.engine.positions if p.status == "open"]
-        
+
         if open_positions:
-            open_pos = open_positions[0]  # Должна быть только одна
+            open_pos = open_positions[0]
             unrealized_pnl = self.engine.get_unrealized_pnl()
             unrealized_net = unrealized_pnl - open_pos.fees
         else:
             unrealized_pnl = 0.0
             unrealized_net = 0.0
 
-        # Итоговый баланс
         initial_balance = self.engine.strategy.initial_balance if self.engine.strategy else 0
         final_equity = initial_balance + net_pnl_closed + unrealized_net
-        
-        # Общий net PnL (закрытые + открытая)
+
         total_net_pnl = net_pnl_closed + unrealized_net
         return_pct = (total_net_pnl / initial_balance * 100) if initial_balance > 0 else 0
 

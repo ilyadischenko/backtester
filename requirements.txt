@@ -3,3 +3,5 @@ polars
 mplfinance
 pandas
 bokeh
+numpy
+numba

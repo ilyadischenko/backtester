@@ -1,11 +1,11 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Dict
 import random
 import math
 import polars as pl
 
 
-@dataclass
+@dataclass(slots=True)
 class Order:
     id: int
     price: float
@@ -20,7 +20,7 @@ class Order:
     cancel_requested_at: Optional[int] = None    
 
 
-@dataclass
+@dataclass(slots=True)
 class Position:
     id: int
     open_time: int
@@ -35,7 +35,7 @@ class Position:
     net_pnl: float = 0.0                  # realized_pnl - fees (заполняется при закрытии)
     
     # История ордеров
-    order_ids: List[int] = None           # Все ордера, влиявшие на позицию
+    order_ids: List[int] = field(default_factory=list)          # Все ордера, влиявшие на позицию
     
     def __post_init__(self):
         if self.order_ids is None:
