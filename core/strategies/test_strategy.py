@@ -1,85 +1,182 @@
-# strategies/market_maker.py
-from typing import Set
+# strategies/grid_averaging.py
+from typing import Optional
 
 
-class MarketMakerStrategy:
+class GridAveragingStrategy:
+    """
+    Стратегия усреднения позиции по сетке:
+    
+    1. Открываем начальную позицию по рынку
+    2. Если цена идёт против нас на N% — добавляем к позиции (усредняем)
+    3. Максимум M добавлений
+    4. Закрываем всю позицию при достижении тейк-профита от средней цены
+    5. Стоп-лосс на всю позицию
+    
+    Это создаст несколько горизонтальных линий средней цены!
+    """
 
     def __init__(
             self,
             initial_balance: float = 10000.0,
-            order_size_usd: float = 100.0,
-            spread_bps: float = 5.0,
-            max_position_usd: float = 500.0,
-            refresh_interval_ms: int = 1000,
+            initial_order_usd: float = 100.0,
+            add_order_usd: float = 150.0,      # Добавление больше чем первый вход
+            grid_step_bps: float = 50.0,       # Шаг сетки 0.5%
+            max_additions: int = 3,            # Максимум 3 добавления
+            take_profit_bps: float = 100.0,    # TP 1% от средней
+            stop_loss_bps: float = 300.0,      # SL 3% от средней
+            direction: str = "long",           # "long" или "short"
     ):
         self.initial_balance = initial_balance
-        self.order_size_usd = order_size_usd
-        self.spread_bps = spread_bps
-        self.max_position_usd = max_position_usd
-        self.refresh_interval_ms = refresh_interval_ms
+        self.initial_order_usd = initial_order_usd
+        self.add_order_usd = add_order_usd
+        self.grid_step_bps = grid_step_bps
+        self.max_additions = max_additions
+        self.take_profit_bps = take_profit_bps
+        self.stop_loss_bps = stop_loss_bps
+        self.direction = direction
 
-        self.last_refresh_time = 0
-        self.active_order_ids: Set[int] = set()
+        # State
+        self.position_opened = False
+        self.additions_count = 0
+        self.last_add_price: Optional[float] = None
+        self.warmup_ticks = 0
 
     def on_tick(self, event, engine):
         if event["event_type"] != "bookticker":
             return
 
-        current_time = event["event_time"]
-
-        if current_time - self.last_refresh_time < self.refresh_interval_ms:
-            return
-
-        self.last_refresh_time = current_time
-
-        # Отменяем старые
-        for order_id in list(self.active_order_ids):
-            engine.cancel_order(order_id)
-        self.active_order_ids.clear()
-
-        # Цены
         bid = event["bid_price"]
         ask = event["ask_price"]
         mid = (bid + ask) / 2
 
-        half_spread = mid * (self.spread_bps / 10000) / 2
-        our_bid = mid - half_spread
-        our_ask = mid + half_spread
-
-        size_in_coins = self.order_size_usd / mid
-
-        pos_size = engine.get_position_size()
-        pos_value = abs(pos_size * mid)
-
-        # Контроль позиции
-        if pos_value > self.max_position_usd:
-            if pos_size > 0:
-                oid = engine.place_order("limit", our_ask, -size_in_coins)
-                self.active_order_ids.add(oid)
-            else:
-                oid = engine.place_order("limit", our_bid, size_in_coins)
-                self.active_order_ids.add(oid)
+        # Небольшой прогрев — ждём 100 тиков
+        if self.warmup_ticks < 100:
+            self.warmup_ticks += 1
             return
 
-        # Skew
-        skew = (pos_size * mid / self.max_position_usd) * half_spread * 0.5 if self.max_position_usd > 0 else 0
-        our_bid -= skew
-        our_ask -= skew
+        # Получаем текущую позицию
+        pos = self._get_open_position(engine)
+        pos_size = pos.size if pos else 0.0
 
-        # Ордера
-        if our_bid < bid:
-            oid = engine.place_order("limit", our_bid, size_in_coins)
-            self.active_order_ids.add(oid)
+        # ═══════════════════════════════════════════════════════
+        # Если позиции нет — открываем первую
+        # ═══════════════════════════════════════════════════════
+        if not self.position_opened and pos_size == 0:
+            self._open_initial_position(engine, mid)
+            return
 
-        if our_ask > ask:
-            oid = engine.place_order("limit", our_ask, -size_in_coins)
-            self.active_order_ids.add(oid)
+        # ═══════════════════════════════════════════════════════
+        # Если есть позиция — проверяем TP/SL и добавления
+        # ═══════════════════════════════════════════════════════
+        if pos and pos_size != 0:
+            avg_price = pos.price
 
-    def get_equity(self, engine) -> float:
-        return self.initial_balance + engine.get_net_pnl() + engine.get_unrealized_pnl()
+            # Проверяем тейк-профит от средней цены
+            if self._check_take_profit(pos_size, mid, avg_price):
+                self._close_position(engine, pos_size)
+                self._reset_state()
+                return
 
-    def get_return_pct(self, engine) -> float:
-        return (self.get_equity(engine) - self.initial_balance) / self.initial_balance * 100
+            # Проверяем стоп-лосс от средней цены
+            if self._check_stop_loss(pos_size, mid, avg_price):
+                self._close_position(engine, pos_size)
+                self._reset_state()
+                return
 
-    def get_total_fees(self, engine) -> float:
-        return engine.get_total_fees()
+            # Проверяем условие для добавления в позицию
+            if self.additions_count < self.max_additions:
+                if self._should_add_to_position(pos_size, mid):
+                    self._add_to_position(engine, mid)
+                    return
+
+    def _open_initial_position(self, engine, mid: float):
+        """Открываем первую позицию"""
+        size_in_coins = self.initial_order_usd / mid
+
+        if self.direction == "long":
+            engine.place_order("market", price=0, size=size_in_coins)
+            self.last_add_price = mid
+        else:  # short
+            engine.place_order("market", price=0, size=-size_in_coins)
+            self.last_add_price = mid
+
+        self.position_opened = True
+        print(f"[OPEN] Initial {self.direction} position at {mid:.5f}")
+
+    def _should_add_to_position(self, pos_size: float, mid: float) -> bool:
+        """
+        Проверяет, нужно ли добавить к позиции.
+        Добавляем если цена ушла против нас на grid_step_bps от последнего добавления.
+        """
+        if self.last_add_price is None:
+            return False
+
+        price_change_bps = (mid - self.last_add_price) / self.last_add_price * 10000
+
+        if self.direction == "long":
+            # Long: добавляем если цена упала
+            return price_change_bps <= -self.grid_step_bps
+        else:
+            # Short: добавляем если цена выросла
+            return price_change_bps >= self.grid_step_bps
+
+    def _add_to_position(self, engine, mid: float):
+        """Добавляем к позиции (усредняем)"""
+        size_in_coins = self.add_order_usd / mid
+
+        if self.direction == "long":
+            engine.place_order("market", price=0, size=size_in_coins)
+        else:
+            engine.place_order("market", price=0, size=-size_in_coins)
+
+        self.additions_count += 1
+        self.last_add_price = mid
+        print(f"[ADD {self.additions_count}] Adding to {self.direction} at {mid:.5f}")
+
+    def _check_take_profit(self, pos_size: float, mid: float, avg_price: float) -> bool:
+        """Проверяет достижение тейк-профита от средней цены"""
+        if self.direction == "long":
+            pnl_bps = (mid - avg_price) / avg_price * 10000
+        else:
+            pnl_bps = (avg_price - mid) / avg_price * 10000
+
+        if pnl_bps >= self.take_profit_bps:
+            print(f"[TP] Take profit hit at {mid:.5f} (avg: {avg_price:.5f}, pnl: {pnl_bps:.1f}bps)")
+            return True
+        return False
+
+    def _check_stop_loss(self, pos_size: float, mid: float, avg_price: float) -> bool:
+        """Проверяет достижение стоп-лосса от средней цены"""
+        if self.direction == "long":
+            pnl_bps = (mid - avg_price) / avg_price * 10000
+        else:
+            pnl_bps = (avg_price - mid) / avg_price * 10000
+
+        if pnl_bps <= -self.stop_loss_bps:
+            print(f"[SL] Stop loss hit at {mid:.5f} (avg: {avg_price:.5f}, pnl: {pnl_bps:.1f}bps)")
+            return True
+        return False
+
+    def _close_position(self, engine, pos_size: float):
+        """Закрываем всю позицию"""
+        engine.place_order("market", price=0, size=-pos_size)
+        print(f"[CLOSE] Closing entire position (size: {pos_size:.8f})")
+
+    def _reset_state(self):
+        """Сбрасываем состояние для новой позиции"""
+        self.position_opened = False
+        self.additions_count = 0
+        self.last_add_price = None
+
+    def _get_open_position(self, engine):
+        """Получает открытую позицию из движка"""
+        for p in engine.positions:
+            if p.status == "open":
+                return p
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════
+# ПРИМЕР ИСПОЛЬЗОВАНИЯ
+# ═══════════════════════════════════════════════════════════════
+

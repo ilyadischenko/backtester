@@ -1,5 +1,5 @@
 # strategies/mean_reversion.py
-from typing import Set, Optional
+from typing import Optional
 from collections import deque
 
 
@@ -18,9 +18,9 @@ class MeanReversionStrategy:
             initial_balance: float = 10000.0,
             order_size_usd: float = 100.0,
             ma_period: int = 2000,  # Период MA в тиках
-            entry_threshold_bps: float = 30.0,  # Вход при отклонении 0.1%
-            take_profit_bps: float = 25.0,  # Тейк 0.05%
-            stop_loss_bps: float = 5.0,  # Стоп 0.15%
+            entry_threshold_bps: float = 30.0,  # Вход при отклонении 0.3%
+            take_profit_bps: float = 25.0,  # Тейк 0.25%
+            stop_loss_bps: float = 50.0,  # Стоп 0.5%
             max_position_usd: float = 300.0,  # Макс позиция
             cooldown_ms: int = 5000,  # Пауза между сделками
     ):
@@ -37,7 +37,6 @@ class MeanReversionStrategy:
         self.prices: deque = deque(maxlen=ma_period)
         self.last_trade_time: int = 0
         self.entry_price: Optional[float] = None
-        self.active_order_ids: Set[int] = set()
 
     def on_tick(self, event, engine):
         if event["event_type"] != "bookticker":
@@ -58,7 +57,11 @@ class MeanReversionStrategy:
         ma = sum(self.prices) / len(self.prices)
         deviation_bps = (mid - ma) / ma * 10000
 
-        pos_size = engine.get_position_size()
+        # ═══════════════════════════════════════════════════════
+        # Получаем текущую позицию из движка
+        # ═══════════════════════════════════════════════════════
+        pos = self._get_open_position(engine)
+        pos_size = pos.size if pos else 0.0
         pos_value = abs(pos_size * mid)
 
         # ═══════════════════════════════════════════════════════
@@ -69,12 +72,12 @@ class MeanReversionStrategy:
 
             # Take Profit
             if pnl_bps >= self.take_profit_bps:
-                self._close_position(engine, pos_size, bid, ask)
+                self._close_position(engine, pos_size)
                 return
 
             # Stop Loss
             if pnl_bps <= -self.stop_loss_bps:
-                self._close_position(engine, pos_size, bid, ask)
+                self._close_position(engine, pos_size)
                 return
 
         # ═══════════════════════════════════════════════════════
@@ -94,30 +97,42 @@ class MeanReversionStrategy:
         size_in_coins = self.order_size_usd / mid
 
         # Цена ниже MA — покупаем (ждём возврат вверх)
-        if deviation_bps <= -self.entry_threshold_bps and pos_size <= 0:
-            engine.place_order("market", price=0, size=size_in_coins)
-            self.entry_price = ask
-            self.last_trade_time = current_time
+        if deviation_bps <= -self.entry_threshold_bps:
+            # Можем покупать только если нет позиции или она short
+            if pos_size <= 0:
+                engine.place_order("market", price=0, size=size_in_coins)
+                self.entry_price = ask
+                self.last_trade_time = current_time
             return
 
         # Цена выше MA — продаём (ждём возврат вниз)
-        if deviation_bps >= self.entry_threshold_bps and pos_size >= 0:
-            engine.place_order("market", price=0, size=-size_in_coins)
-            self.entry_price = bid
-            self.last_trade_time = current_time
+        if deviation_bps >= self.entry_threshold_bps:
+            # Можем продавать только если нет позиции или она long
+            if pos_size >= 0:
+                engine.place_order("market", price=0, size=-size_in_coins)
+                self.entry_price = bid
+                self.last_trade_time = current_time
             return
+
+    def _get_open_position(self, engine):
+        """Получает открытую позицию из движка."""
+        for p in engine.positions:
+            if p.status == "open":
+                return p
+        return None
 
     def _get_pnl_bps(self, pos_size: float, mid: float) -> float:
         """PnL в базисных пунктах."""
         if not self.entry_price or self.entry_price == 0:
             return 0.0
 
-        if pos_size > 0:
+        if pos_size > 0:  # Long
             return (mid - self.entry_price) / self.entry_price * 10000
-        else:
+        else:  # Short
             return (self.entry_price - mid) / self.entry_price * 10000
 
-    def _close_position(self, engine, pos_size: float, bid: float, ask: float):
+    def _close_position(self, engine, pos_size: float):
         """Закрываем позицию маркет ордером."""
         engine.place_order("market", price=0, size=-pos_size)
         self.entry_price = None
+        self.last_trade_time = engine.last_event_time

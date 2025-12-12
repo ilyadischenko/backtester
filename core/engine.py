@@ -9,13 +9,15 @@ import polars as pl
 class Order:
     id: int
     price: float
-    size: float              # >0 buy, <0 sell
-    type: str                # "market" | "limit"
+    size: float
+    type: str
     created_time: int
     exchange_time: int = 0
     filled: float = 0.0
     fill_price: float = 0.0
-    status: str = "pending"  # "pending" | "new" | "filled" | "canceled"
+    fill_time: int = 0                           # НОВОЕ
+    status: str = "pending"
+    cancel_requested_at: Optional[int] = None    
 
 
 @dataclass
@@ -23,12 +25,21 @@ class Position:
     id: int
     open_time: int
     size: float = 0.0
-    price: float = 0.0
+    price: float = 0.0                    # Средняя цена входа
     close_time: Optional[int] = None
-    fees: float = 0.0
     status: str = "open"
-    realized_pnl: float = 0.0
-
+    
+    # PnL разделён на компоненты
+    realized_pnl: float = 0.0             # Чистый P&L (без комиссий)
+    fees: float = 0.0                     # Сумма всех комиссий
+    net_pnl: float = 0.0                  # realized_pnl - fees (заполняется при закрытии)
+    
+    # История ордеров
+    order_ids: List[int] = None           # Все ордера, влиявшие на позицию
+    
+    def __post_init__(self):
+        if self.order_ids is None:
+            self.order_ids = []
 
 class ExchangeEngine:
     EPSILON = 1e-12
@@ -159,10 +170,9 @@ class ExchangeEngine:
 
             elif req["action"] == "cancel":
                 for o in self.orders:
-                    if o.id == req["id"] and o.status == "new":
-                        o.status = "canceled"
+                    if o.id == req["id"] and o.cancel_requested_at is None:
+                        o.cancel_requested_at = arrival  # ✅ Записываем время!
                         break
-
     # ═══════════════════════════════════════════════════════════
     # ORDER EXECUTION
     # ═══════════════════════════════════════════════════════════
@@ -177,12 +187,21 @@ class ExchangeEngine:
         for order in self.orders:
             if order.status != "new":
                 continue
-
             if order.exchange_time > self.last_event_time:
                 continue
 
             # ─────────────────────────────────────────────────
-            # MARKET ORDER — исполняется сразу
+            # Race condition: cancel дошёл ДО этого тика — отменяем
+            # ─────────────────────────────────────────────────
+            if (order.cancel_requested_at is not None 
+                and order.cancel_requested_at < self.last_event_time):
+                order.status = "canceled"
+                continue
+
+            just_placed = order.exchange_time == self.last_event_time
+
+            # ─────────────────────────────────────────────────
+            # MARKET ORDER
             # ─────────────────────────────────────────────────
             if order.type == "market":
                 exec_price = ask if order.size > 0 else bid
@@ -193,97 +212,154 @@ class ExchangeEngine:
             # LIMIT ORDER
             # ─────────────────────────────────────────────────
             if order.type == "limit":
-                if order.size > 0:  # Buy limit
-                    # Агрессивный: цена >= ask → исполняем как taker по ask
-                    if order.price >= ask:
-                        self._fill_order(order, ask, is_maker=False)
-                    # Пассивный: ждём пока ask <= нашей цены
-                    elif ask <= order.price:
-                        self._fill_order(order, order.price, is_maker=True)
+                filled = self._try_fill_limit_order(order, bid, ask, just_placed)
 
-                else:  # Sell limit (order.size < 0)
-                    # Агрессивный: цена <= bid → исполняем как taker по bid
-                    if order.price <= bid:
-                        self._fill_order(order, bid, is_maker=False)
-                    # Пассивный: ждём пока bid >= нашей цены
-                    elif bid >= order.price:
-                        self._fill_order(order, order.price, is_maker=True)
+                # Race condition: cancel в ЭТОМ тике, но fill не случился
+                if (not filled 
+                    and order.cancel_requested_at is not None
+                    and order.cancel_requested_at <= self.last_event_time):
+                    order.status = "canceled"
+
+    def _try_fill_limit_order(
+        self, order: Order, bid: float, ask: float, just_placed: bool
+    ) -> bool:
+        """Пытается исполнить лимитный ордер. Возвращает True если исполнен."""
+        is_buy = order.size > 0
+
+        if is_buy:
+            # Агрессивный: цена >= ask при размещении → taker
+            if just_placed and order.price >= ask:
+                self._fill_order(order, ask, is_maker=False)
+                return True
+
+            # Пассивный вариант 1: сделка прошла по уровню
+            if self._trade_hit_level(order):
+                self._fill_order(order, order.price, is_maker=True)
+                return True
+            
+            # Пассивный вариант 2: ask провалился ниже нашего ордера
+            # (в реальности наш ордер собрали бы)
+            if ask <= order.price:
+                self._fill_order(order, order.price, is_maker=True)
+                return True
+
+        else:  # Sell
+            if just_placed and order.price <= bid:
+                self._fill_order(order, bid, is_maker=False)
+                return True
+
+            if self._trade_hit_level(order):
+                self._fill_order(order, order.price, is_maker=True)
+                return True
+            
+            # Пассивный вариант 2: bid поднялся выше нашего ордера
+            if bid >= order.price:
+                self._fill_order(order, order.price, is_maker=True)
+                return True
+
+        return False
+
+    def _trade_hit_level(self, order: Order) -> bool:
+        """Проверяет, прошла ли сделка по уровню ордера"""
+        if not self.last_trade:
+            return False
+        
+        if self.last_trade.get("event_type") != "trade":
+            return False
+
+        trade_price = self.last_trade.get("price", 0)
+        is_buyer_maker = self.last_trade.get("is_maker", False)
+
+        if order.size > 0:  # Buy limit — ждём агрессивную продажу
+            # is_buyer_maker=True → продавец был taker → sell прошёл вниз
+            return is_buyer_maker and trade_price <= order.price
+        
+        else:  # Sell limit — ждём агрессивную покупку
+            # is_buyer_maker=False → покупатель был taker → buy прошёл вверх
+            return (not is_buyer_maker) and trade_price >= order.price
+        
 
     def _fill_order(self, order: Order, price: float, is_maker: bool):
         """Полностью исполняет ордер."""
         fee_rate = self.maker_fee if is_maker else self.taker_fee
-        
+
         order.filled = order.size
         order.fill_price = price
+        order.fill_time = self.last_event_time
         order.status = "filled"
 
-        # Обновляем позицию
-        self._update_position(order.size, price, fee_rate)
+        # Передаём order.id в позицию
+        self._update_position(order.size, price, fee_rate, order.id)
 
     # ═══════════════════════════════════════════════════════════
     # POSITION LOGIC
     # ═══════════════════════════════════════════════════════════
 
-    def _update_position(self, trade_size: float, price: float, fee_rate: float):
+    def _update_position(self, trade_size: float, price: float, fee_rate: float, order_id: int):
         pos = self._get_or_create_position()
+        pos.order_ids.append(order_id)
 
         trade_abs = abs(trade_size)
         fee = trade_abs * price * fee_rate
-        pos.fees += fee
+        # НЕ добавляем fee сразу - распределим позже
 
         pos_abs = abs(pos.size)
 
-        # ─────────────────────────────────────────────────
-        # Случай 0: Пустая позиция — открываем
-        # ─────────────────────────────────────────────────
+        # Случай 0: открытие
         if self._is_zero(pos.size):
             pos.size = trade_size
             pos.price = price
+            pos.fees += fee  # ✅ Добавляем здесь
             return
 
-        # ─────────────────────────────────────────────────
-        # Случай 1: Та же сторона — усреднение
-        # ─────────────────────────────────────────────────
+        # Случай 1: усреднение
         if pos.size * trade_size > 0:
             old_notional = pos_abs * pos.price
             new_notional = trade_abs * price
             total = pos_abs + trade_abs
-
             pos.price = (old_notional + new_notional) / total
             pos.size += trade_size
+            pos.fees += fee  # ✅ Добавляем здесь
             return
 
-        # ─────────────────────────────────────────────────
-        # Случай 2: Противоположная сторона
-        # ─────────────────────────────────────────────────
+        # Случай 2: закрытие
         closed_qty = min(pos_abs, trade_abs)
-
-        # PnL по закрываемой части
+        
         if pos.size > 0:
             pnl = (price - pos.price) * closed_qty
         else:
             pnl = (pos.price - price) * closed_qty
-
+        
         pos.realized_pnl += pnl
 
-        # 2.1: Частичное закрытие
+        # 2.1: частичное
         if trade_abs < pos_abs - self.EPSILON:
             pos.size += trade_size
+            pos.fees += fee  # ✅ Вся комиссия за закрытие
             return
 
-        # 2.2: Полное закрытие
+        # 2.2: полное
         if self._is_close(trade_abs, pos_abs):
+            pos.fees += fee  # ✅ Вся комиссия за закрытие
             self._close_position(pos)
             return
 
-        # 2.3: Переворот
+        # 2.3: переворот
         remaining = trade_abs - pos_abs
+        
+        # Распределяем комиссию пропорционально
+        close_fee = fee * (pos_abs / trade_abs)
+        open_fee = fee * (remaining / trade_abs)
+        
+        pos.fees += close_fee  # ✅ Комиссия за закрытие
         self._close_position(pos)
-
+        
+        # Новая позиция
         new_pos = self._create_position()
         new_pos.size = math.copysign(remaining, trade_size)
         new_pos.price = price
-
+        new_pos.order_ids.append(order_id)
+        new_pos.fees = open_fee  # ✅ Комиссия за открытие
     # ═══════════════════════════════════════════════════════════
     # POSITION HELPERS
     # ═══════════════════════════════════════════════════════════
@@ -303,9 +379,13 @@ class ExchangeEngine:
         return pos
 
     def _close_position(self, pos: Position):
+        """Закрывает позицию и рассчитывает финальный net PnL"""
         pos.size = 0.0
         pos.close_time = self.last_event_time
         pos.status = "closed"
+        
+        # Финальный расчёт: прибыль минус комиссии
+        pos.net_pnl = pos.realized_pnl - pos.fees
 
     # ═══════════════════════════════════════════════════════════
     # FLOAT HELPERS
@@ -321,26 +401,20 @@ class ExchangeEngine:
     # PUBLIC API
     # ═══════════════════════════════════════════════════════════
 
-    def get_position(self) -> Optional[Position]:
-        for p in self.positions:
-            if p.status == "open" and not self._is_zero(p.size):
-                return p
-        return None
-
-    def get_position_size(self) -> float:
-        pos = self.get_position()
-        return pos.size if pos else 0.0
-
     def get_realized_pnl(self) -> float:
+        """Суммарный realized PnL (без комиссий)"""
         return sum(p.realized_pnl for p in self.positions)
 
     def get_total_fees(self) -> float:
+        """Суммарные комиссии по всем позициям"""
         return sum(p.fees for p in self.positions)
 
     def get_net_pnl(self) -> float:
-        return self.get_realized_pnl() - self.get_total_fees()
+        """Чистая прибыль = PnL - комиссии"""
+        return sum(p.net_pnl for p in self.positions if p.status == "closed")
 
     def get_unrealized_pnl(self) -> float:
+        """Нереализованный PnL открытой позиции"""
         pos = self.get_position()
         if pos is None:
             return 0.0
@@ -350,52 +424,56 @@ class ExchangeEngine:
 
         if pos.size > 0:
             mark = self.last_bookticker["bid_price"]
-            return (mark - pos.price) * pos.size
+            unrealized = (mark - pos.price) * pos.size
         else:
             mark = self.last_bookticker["ask_price"]
-            return (pos.price - mark) * abs(pos.size)
+            unrealized = (pos.price - mark) * abs(pos.size)
         
-def test_limit_orders():
-    engine = ExchangeEngine()
-    engine.last_event_time = 1000
-    engine.network_delay = 0  # Для теста убираем задержку
-    
-    # Симулируем bookticker
-    engine.last_bookticker = {"bid_price": 99.0, "ask_price": 101.0}
-    
-    # ═══════════════════════════════════════════════════════════
-    # Тест 1: Пассивный buy limit (ждёт)
-    # ═══════════════════════════════════════════════════════════
-    engine.place_order("limit", price=98.0, size=10)
-    engine._process_requests()
-    engine._process_orders()
-    
-    assert engine.orders[0].status == "new", "Должен ждать"
-    print("✅ Тест 1: Пассивный buy limit ждёт")
-    
-    # Цена дошла
-    engine.last_bookticker = {"bid_price": 97.0, "ask_price": 98.0}
-    engine._process_orders()
-    
-    assert engine.orders[0].status == "filled"
-    assert engine.orders[0].fill_price == 98.0  # По лимитной цене
-    print("✅ Тест 1: Исполнился по лимитной цене")
-    
-    # ═══════════════════════════════════════════════════════════
-    # Тест 2: Агрессивный buy limit (сразу)
-    # ═══════════════════════════════════════════════════════════
-    engine.orders.clear()
-    engine.positions.clear()
-    engine.last_bookticker = {"bid_price": 99.0, "ask_price": 100.0}
-    
-    engine.place_order("limit", price=101.0, size=10)  # Выше ask!
-    engine._process_requests()
-    engine._process_orders()
-    
-    assert engine.orders[0].status == "filled"
-    assert engine.orders[0].fill_price == 100.0  # По ask (taker)
-    print("✅ Тест 2: Агрессивный buy limit исполнился как taker")
-    
-    print("\n🎉 Все тесты пройдены!")
+        return unrealized
 
-# test_limit_orders()
+    def get_unrealized_net_pnl(self) -> float:
+        """Нереализованный чистый PnL (с учётом комиссий)"""
+        pos = self.get_position()
+        if pos is None:
+            return 0.0
+        
+        unrealized_gross = self.get_unrealized_pnl()
+        return unrealized_gross - pos.fees
+
+    def get_position_summary(self, position_id: int) -> dict:
+        """Детальная информация о позиции"""
+        pos = next((p for p in self.positions if p.id == position_id), None)
+        if not pos:
+            return {}
+        
+        orders = [o for o in self.orders if o.id in pos.order_ids]
+        
+        return {
+            "id": pos.id,
+            "status": pos.status,
+            "open_time": pos.open_time,
+            "close_time": pos.close_time,
+            "entry_price": pos.price,
+            "size": pos.size,
+            "realized_pnl": pos.realized_pnl,
+            "fees": pos.fees,
+            "net_pnl": pos.net_pnl,
+            "order_count": len(pos.order_ids),
+            "orders": [
+                {
+                    "id": o.id,
+                    "type": o.type,
+                    "size": o.size,
+                    "price": o.fill_price,
+                    "time": o.fill_time,
+                }
+                for o in orders
+            ],
+        }
+        
+    def get_position(self):
+        """Возвращает текущую открытую позицию (если есть)"""
+        for p in self.positions:
+            if p.status == "open":
+                return p
+        return None
