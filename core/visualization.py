@@ -7,7 +7,7 @@ from bokeh.layouts import column, row
 from bokeh.events import Tap
 import pandas as pd
 
-from core.engine import ExchangeEngine
+from engine import ExchangeEngine
 
 
 class BacktestVisualizer:

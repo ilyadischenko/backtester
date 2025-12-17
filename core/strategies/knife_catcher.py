@@ -235,6 +235,8 @@ class KnifeCatcherUltraFast:
             vol_buffer_size: int = 1000,
     ):
         # Параметры
+        self.initial_balance = initial_balance
+
         self.market_order_size_usd = market_order_size_usd
         self.limit_order_1_size_usd = limit_order_1_size_usd
         self.limit_order_2_size_usd = limit_order_2_size_usd

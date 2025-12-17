@@ -1,15 +1,23 @@
-
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 import polars as pl
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 from dataclasses import dataclass
 
-from config import S3_CONFIG, DATA_DIR
+# from config import S3_CONFIG, DATA_DIR
 
+DATA_DIR = Path("../store") 
+S3_CONFIG = {
+    "bucket": "data-collector-hft",
+    "prefix": "",
+    "endpoint_url": "https://storage.yandexcloud.net",
+    "aws_access_key_id": "YCAJEVJeIO1bNwwm7wm9o9by1",
+    "aws_secret_access_key": "YCNJ_6Frr8TWLFZxASFW47ZeYGFTtEawQaE0gwXa",
+    "aws_region": "ru-central1",
+}
 
 @dataclass
 class MarketData:
@@ -23,10 +31,39 @@ class MarketData:
         return f"MarketData(orderbook={ob_rows:,} rows, trades={tr_rows:,} rows)"
 
 
-class DataManager:
-    """Клиент для работы с S3"""
+# Стандартные схемы колонок (формат Binance/Bybit)
+COLUMN_SCHEMAS = {
+    "orderbook": ["event_time", "update_id", "bid_price", "bid_qty", "ask_price", "ask_qty"],
+    "trades": ["event_time", "trade_id", "price", "qty", "trade_time", "is_maker"],
+}
+
+# Схемы для Gate.io (qty со знаком, без is_maker)
+GATE_COLUMN_SCHEMAS = {
+    "orderbook": ["event_time", "update_id", "bid_price", "bid_qty", "ask_price", "ask_qty"],
+    "trades": ["event_time", "trade_id", "price", "qty", "trade_time"],
+}
+
+
+def to_utc(dt: datetime | str) -> datetime:
+    """
+    Конвертирует datetime в UTC.
+    Если передана строка — парсит и добавляет UTC.
+    Если datetime без tzinfo — считаем что это уже UTC.
+    """
+    if isinstance(dt, str):
+        dt = datetime.fromisoformat(dt)
     
-    # Типы данных и их суффиксы в именах файлов
+    if dt.tzinfo is None:
+        # Naive datetime — считаем UTC
+        return dt.replace(tzinfo=timezone.utc)
+    else:
+        # Aware datetime — конвертируем в UTC
+        return dt.astimezone(timezone.utc)
+
+
+class DataManager:
+    """Клиент для работы с S3. Все операции в UTC."""
+    
     DATA_TYPES = {
         "orderbook": "_orderbook.gz",
         "trades": "_trades.gz",
@@ -36,7 +73,6 @@ class DataManager:
         self.bucket = S3_CONFIG["bucket"]
         self.prefix = S3_CONFIG["prefix"]
         
-        # Создаём клиент
         self.client = boto3.client(
             "s3",
             endpoint_url=S3_CONFIG.get("endpoint_url"),
@@ -49,9 +85,8 @@ class DataManager:
             ),
         )
         
-        # Для upload/download больших файлов
         self.transfer_config = boto3.s3.transfer.TransferConfig(
-            multipart_threshold=8 * 1024 * 1024,  # 8MB
+            multipart_threshold=8 * 1024 * 1024,
             max_concurrency=10,
             multipart_chunksize=8 * 1024 * 1024,
         )
@@ -86,9 +121,6 @@ class DataManager:
                 return False
             raise
     
-    
-    # ==================== Загрузка/Скачивание ====================
-    
     def download_bytes(self, key: str) -> bytes:
         """Скачать как байты"""
         response = self.client.get_object(
@@ -97,42 +129,59 @@ class DataManager:
         )
         return response["Body"].read()
     
+    # ==================== Детекция и нормализация ====================
+    
+    def _detect_data_type(self, key: str) -> str | None:
+        """Определяет тип данных по имени файла"""
+        for dtype, suffix in self.DATA_TYPES.items():
+            if suffix in key:
+                return dtype
+        return None
+    
+    def _detect_exchange(self, key: str) -> str | None:
+        """Определяет биржу по пути файла"""
+        key_lower = key.lower()
+        if "/binance/" in key_lower:
+            return "binance"
+        elif "/bybit/" in key_lower:
+            return "bybit"
+        elif "/gate/" in key_lower:
+            return "gate"
+        return None
+    
+    def _normalize_gate_trades(self, df: pl.DataFrame) -> pl.DataFrame:
+        """
+        Нормализует trades Gate.io к формату Binance.
+        
+        Gate.io: qty < 0 = тейкер sell, qty > 0 = тейкер buy
+        Binance: is_maker = 1 если buyer is maker
+        """
+        return df.with_columns([
+            (pl.col("qty") < 0).cast(pl.Int8).alias("is_maker"),
+            pl.col("qty").abs().alias("qty"),
+        ])
+    
+    # ==================== Загрузка файлов ====================
+    
     def load_csv_gz(self, key: str, cache_dir: Path | str | None = None) -> pl.DataFrame:
         """
-        Загрузить CSV.GZ файл и вернуть DataFrame.
-        Если файл есть локально - использует его, иначе скачивает из S3.
-        
-        Args:
-            key: путь к файлу в S3 (например, "futures/binance/btcusdt/20251204/20_orderbook.gz")
-            cache_dir: директория для кэша (по умолчанию из DATA_DIR)
-            
-        Returns:
-            pl.DataFrame
+        Загрузить CSV.GZ файл и вернуть DataFrame с именованными колонками.
         """
-        # Определяем директорию кэша
         if cache_dir is None:
             cache_dir = Path(DATA_DIR)
         else:
             cache_dir = Path(cache_dir)
         
-        # Локальный путь для кэша
         local_cache_path = cache_dir / key
         
-        # Проверяем наличие файла локально
         if not local_cache_path.exists():
             print(f"📥 Файл не найден локально, скачиваю из S3: {key}")
             
             try:
-                # Создаем директории
                 local_cache_path.parent.mkdir(parents=True, exist_ok=True)
             except OSError as e:
-                raise OSError(
-                    f"❌ Невозможно создать директорию {local_cache_path.parent}.\n"
-                    f"Ошибка: {e}\n"
-                    f"Проверьте права доступа или измените DATA_DIR в config.py"
-                ) from e
+                raise OSError(f"❌ Невозможно создать директорию: {e}") from e
             
-            # Скачиваем файл
             full_key = f"{self.prefix}{key}" if self.prefix else key
             
             try:
@@ -142,22 +191,38 @@ class DataManager:
                     raise FileNotFoundError(f"❌ Файл не найден в S3: {full_key}") from e
                 raise
             
-            # Сохраняем
             try:
                 with open(local_cache_path, 'wb') as f:
                     f.write(data)
                 print(f"✅ Файл сохранен: {local_cache_path}")
             except OSError as e:
-                raise OSError(
-                    f"❌ Невозможно сохранить файл {local_cache_path}.\n"
-                    f"Ошибка: {e}\n"
-                    f"Проверьте права доступа"
-                ) from e
+                raise OSError(f"❌ Невозможно сохранить файл: {e}") from e
         else:
             print(f"📁 Используется локальный файл: {local_cache_path}")
         
-        # Polars автоматически распаковывает .gz
-        return pl.read_csv(local_cache_path, has_header=False)
+        df = pl.read_csv(local_cache_path, has_header=False)
+        
+        data_type = self._detect_data_type(key)
+        exchange = self._detect_exchange(key)
+        
+        if exchange == "gate" and data_type == "trades":
+            expected_columns = GATE_COLUMN_SCHEMAS["trades"]
+        elif data_type and data_type in COLUMN_SCHEMAS:
+            expected_columns = COLUMN_SCHEMAS[data_type]
+        else:
+            expected_columns = None
+        
+        if expected_columns:
+            if len(df.columns) == len(expected_columns):
+                df = df.rename(dict(zip(df.columns, expected_columns)))
+            else:
+                print(f"⚠️ Несоответствие колонок в {key}: "
+                      f"ожидается {len(expected_columns)}, получено {len(df.columns)}")
+        
+        if exchange == "gate" and data_type == "trades":
+            df = self._normalize_gate_trades(df)
+        
+        return df
     
     # ==================== Работа с временными диапазонами ====================
     
@@ -170,21 +235,7 @@ class DataManager:
         data_type: Literal["orderbook", "trades", "all"] = "all",
         market_type: Literal["futures", "spot"] = "futures"
     ) -> dict[str, list[str]]:
-        """
-        Генерирует список ключей для почасовых файлов.
-        
-        Args:
-            exchange: "binance", "bybit"
-            symbol: "btcusdt", "ethusdt"
-            start_time: начало периода
-            end_time: конец периода
-            data_type: "orderbook", "trades" или "all" для обоих
-            market_type: тип рынка
-            
-        Returns:
-            Словарь {data_type: [keys]}
-        """
-        # Определяем какие типы данных нужны
+        """Генерирует список ключей для почасовых файлов."""
         if data_type == "all":
             types_to_load = list(self.DATA_TYPES.keys())
         else:
@@ -192,14 +243,10 @@ class DataManager:
         
         keys_by_type: dict[str, list[str]] = {t: [] for t in types_to_load}
         
-        # Начинаем с начала часа
         current = start_time.replace(minute=0, second=0, microsecond=0)
-        
-        # Идем до конца часа, в котором находится end_time
         end_hour = end_time.replace(minute=0, second=0, microsecond=0)
         
         while current <= end_hour:
-            # Формат: futures/binance/btcusdt/20251204/20_orderbook.gz
             date_str = current.strftime("%Y%m%d")
             hour_str = str(current.hour)
             base_path = f"{market_type}/{exchange.lower()}/{symbol.lower()}/{date_str}/{hour_str}"
@@ -219,9 +266,9 @@ class DataManager:
         cache_dir: Path,
         start_ms: int,
         end_ms: int,
-        timestamp_column: str
+        timestamp_column: str = "event_time"
     ) -> pl.DataFrame | None:
-        """Загружает файлы и фильтрует по времени"""
+        """Загружает файлы и фильтрует по времени (UTC)"""
         dfs = []
         
         for key in keys:
@@ -238,18 +285,20 @@ class DataManager:
         if not dfs:
             return None
         
-        # Объединяем
         combined_df = pl.concat(dfs, how="vertical")
         
-        # Фильтруем по времени если есть колонка timestamp
         if timestamp_column in combined_df.columns:
             filtered_df = combined_df.filter(
                 (pl.col(timestamp_column) >= start_ms) &
                 (pl.col(timestamp_column) <= end_ms)
-            )
+            ).sort(timestamp_column)
+            
+            print(f"   📊 До фильтрации: {len(combined_df):,}, после: {len(filtered_df):,}")
             return filtered_df
-        
-        return combined_df
+        else:
+            print(f"   ⚠️ Колонка '{timestamp_column}' не найдена. "
+                  f"Доступные: {combined_df.columns}")
+            return combined_df
     
     def load_timerange(
         self,
@@ -260,52 +309,41 @@ class DataManager:
         data_type: Literal["orderbook", "trades", "all"] = "all",
         market_type: Literal["futures", "spot"] = "futures",
         cache_dir: Path | str | None = None,
-        timestamp_column: str = "timestamp"
+        timestamp_column: str = "event_time"
     ) -> MarketData | pl.DataFrame:
         """
         Загрузить данные за временной диапазон.
         
+        ⚠️ Все времена интерпретируются как UTC!
+        
         Args:
-            exchange: биржа ("binance", "bybit")
+            exchange: биржа ("binance", "bybit", "gate")
             symbol: символ ("btcusdt", "ethusdt")
-            start_time: начало периода (datetime или строка ISO)
-            end_time: конец периода (datetime или строка ISO)
-            data_type: "orderbook", "trades" или "all" для обоих типов
+            start_time: начало периода UTC (datetime или строка ISO)
+            end_time: конец периода UTC (datetime или строка ISO)
+            data_type: "orderbook", "trades" или "all"
             market_type: "futures" или "spot"
             cache_dir: директория для кэша
-            timestamp_column: название колонки с временной меткой
+            timestamp_column: колонка с временной меткой
             
         Returns:
-            MarketData с orderbook и trades DataFrame'ами (если data_type="all")
-            или один DataFrame (если указан конкретный тип)
+            MarketData или DataFrame
             
         Example:
-            >>> # Загрузить оба типа данных
-            >>> data = s3_client.load_timerange(
+            >>> data = dataManager.load_timerange(
             ...     "binance", "btcusdt", 
-            ...     "2025-12-04 13:50:00", "2025-12-04 14:25:00"
-            ... )
-            >>> print(data.orderbook)
-            >>> print(data.trades)
-            
-            >>> # Загрузить только orderbook
-            >>> df = s3_client.load_timerange(
-            ...     "binance", "btcusdt",
-            ...     "2025-12-04 13:50:00", "2025-12-04 14:25:00",
-            ...     data_type="orderbook"
+            ...     "2025-12-17 10:00:00",  # 10:00 UTC
+            ...     "2025-12-17 11:00:00",  # 11:00 UTC
             ... )
         """
-        # Конвертируем строки в datetime
-        if isinstance(start_time, str):
-            start_time = datetime.fromisoformat(start_time)
-        if isinstance(end_time, str):
-            end_time = datetime.fromisoformat(end_time)
+        # Конвертируем в UTC
+        start_time = to_utc(start_time)
+        end_time = to_utc(end_time)
         
         print(f"\n🔍 Загрузка данных для {symbol.upper()} на {exchange.upper()}")
-        print(f"📅 Период: {start_time} → {end_time}")
+        print(f"📅 Период: {start_time.strftime('%Y-%m-%d %H:%M:%S')} → {end_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
         print(f"📊 Тип данных: {data_type}")
         
-        # Генерируем список файлов по типам
         keys_by_type = self._generate_hourly_keys(
             exchange, symbol, start_time, end_time, data_type, market_type
         )
@@ -313,12 +351,12 @@ class DataManager:
         total_files = sum(len(keys) for keys in keys_by_type.values())
         print(f"📦 Требуется файлов: {total_files}")
         
-        # Подготовка
         cache_dir = Path(cache_dir) if cache_dir else Path(DATA_DIR)
+        
+        # Конвертируем в миллисекунды UTC
         start_ms = int(start_time.timestamp() * 1000)
         end_ms = int(end_time.timestamp() * 1000)
         
-        # Проверяем локальное наличие для всех файлов
         all_keys = [key for keys in keys_by_type.values() for key in keys]
         missing_locally = [
             key for key in all_keys
@@ -330,7 +368,6 @@ class DataManager:
         else:
             print(f"✅ Все файлы уже есть локально")
         
-        # Если запрошен конкретный тип - возвращаем DataFrame
         if data_type != "all":
             keys = keys_by_type[data_type]
             df = self._load_and_filter_files(
@@ -338,12 +375,11 @@ class DataManager:
             )
             
             if df is None:
-                raise ValueError(f"❌ Не удалось загрузить ни одного файла {data_type} для {symbol}")
+                raise ValueError(f"❌ Не удалось загрузить данные {data_type} для {symbol}")
             
             print(f"\n📈 Загружено {data_type}: {len(df):,} строк")
             return df
         
-        # Загружаем все типы данных
         result = MarketData()
         
         for dtype, keys in keys_by_type.items():
@@ -371,10 +407,7 @@ class DataManager:
         return "/".join(p.strip("/") for p in all_parts if p) + "/"
     
     def _list_prefixes(self, prefix: str) -> list[str]:
-        """
-        Получает список 'папок' на уровне prefix.
-        Использует delimiter — не скачивает все объекты.
-        """
+        """Получает список 'папок' на уровне prefix."""
         prefixes = []
         paginator = self.client.get_paginator("list_objects_v2")
         
@@ -383,36 +416,40 @@ class DataManager:
             Prefix=prefix,
             Delimiter="/",
         ):
-            # CommonPrefixes содержит "папки"
             for cp in page.get("CommonPrefixes", []):
-                # Извлекаем имя папки
-                # "futures/binance/btcusdt/" -> "btcusdt"
                 folder = cp["Prefix"].rstrip("/").split("/")[-1]
                 prefixes.append(folder)
         
         return prefixes
+    
+    @staticmethod
+    def now_utc() -> datetime:
+        """Текущее время в UTC"""
+        return datetime.now(timezone.utc)
+    
+    @staticmethod
+    def ms_to_utc(ms: int) -> datetime:
+        """Конвертирует миллисекунды в datetime UTC"""
+        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+    
+    @staticmethod
+    def utc_to_ms(dt: datetime | str) -> int:
+        """Конвертирует datetime в миллисекунды UTC"""
+        dt = to_utc(dt)
+        return int(dt.timestamp() * 1000)
 
 
-# Синглтон
 dataManager = DataManager()
 
 
-# ==================== Примеры использования ====================
-if __name__ == "__main__":
-    
-
-    
-
-    df_trades = dataManager.load_timerange(
-        exchange="binance",
-        symbol="cvcusdt",
-        start_time="2025-12-05 12:00:00",
-        end_time="2025-12-05 12:00:00",
-        data_type="all",
-        market_type="futures"
-    )
-    print(f"\nTrades only: {df_trades.orderbook}")
-    
-    # Пример 4: Одиночный файл (старый формат тоже работает)
-    # df = s3_client.load_csv_gz("futures/binance/cvcusdt/20251205/12_orderbook.gz")
-    # print(df)
+# if __name__ == "__main__":
+#     # Теперь всё в UTC!
+#     data = dataManager.load_timerange(
+#         exchange="binance",
+#         symbol="fheusdt",
+#         start_time="2025-12-17 10:00:00",  # Это UTC
+#         end_time="2025-12-17 11:00:00",    # Это UTC
+#         data_type="all",
+#         market_type="futures"
+#     )
+#     print(data)

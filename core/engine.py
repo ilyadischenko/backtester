@@ -53,8 +53,8 @@ class ExchangeEngine:
         maker_fee: float = 0.0002,   # 0.02%
         network_delay: int = 2,
     ):
-        self.bookticker = self._parse_bookticker(data_bookticker)
-        self.trades = self._parse_trades(data_trades)
+        self.bookticker = self._prepare_bookticker(data_bookticker)
+        self.trades = self._prepare_trades(data_trades)
         
         self.events = (
             pl.concat([self.bookticker, self.trades], how="diagonal_relaxed")
@@ -74,32 +74,70 @@ class ExchangeEngine:
         self.last_bookticker: Dict = {}
         self.last_trade: Dict = {}
 
-    def _parse_bookticker(self, df):
+    # def _parse_bookticker(self, df):
+    #     if df is None:
+    #         return pl.DataFrame()
+    #     return (
+    #         df.rename({
+    #             "column_1": "event_time",
+    #             "column_2": "event_id",
+    #             "column_3": "bid_price",
+    #             "column_4": "bid_size",
+    #             "column_5": "ask_price",
+    #             "column_6": "ask_size",
+    #         })
+    #         .with_columns(pl.lit("bookticker").alias("event_type"))
+    #     )
+
+    # def _parse_trades(self, df):
+    #     if df is None:
+    #         return pl.DataFrame()
+    #     return (
+    #         df.rename({
+    #             "column_1": "event_time",
+    #             "column_2": "event_id",
+    #             "column_3": "price",
+    #             "column_4": "quantity",
+    #             "column_5": "time",
+    #             "column_6": "is_maker",
+    #         })
+    #         .with_columns(pl.lit("trade").alias("event_type"))
+    #     )
+
+    def _prepare_bookticker(self, df: pl.DataFrame) -> pl.DataFrame:
+        """
+        Подготовка orderbook данных.
+        Колонки уже именованы в DataManager:
+        event_time, update_id, bid_price, bid_qty, ask_price, ask_qty
+        """
         if df is None:
             return pl.DataFrame()
+        
         return (
-            df.rename({
-                "column_1": "event_time",
-                "column_2": "event_id",
-                "column_3": "bid_price",
-                "column_4": "bid_size",
-                "column_5": "ask_price",
-                "column_6": "ask_size",
+            df
+            .rename({
+                "update_id": "event_id",
+                "bid_qty": "bid_size",
+                "ask_qty": "ask_size",
             })
             .with_columns(pl.lit("bookticker").alias("event_type"))
         )
 
-    def _parse_trades(self, df):
+    def _prepare_trades(self, df: pl.DataFrame) -> pl.DataFrame:
+        """
+        Подготовка trades данных.
+        Колонки уже именованы в DataManager:
+        event_time, trade_id, price, qty, trade_time, is_maker
+        """
         if df is None:
             return pl.DataFrame()
+        
         return (
-            df.rename({
-                "column_1": "event_time",
-                "column_2": "event_id",
-                "column_3": "price",
-                "column_4": "quantity",
-                "column_5": "time",
-                "column_6": "is_maker",
+            df
+            .rename({
+                "trade_id": "event_id",
+                "qty": "quantity",
+                "trade_time": "time",
             })
             .with_columns(pl.lit("trade").alias("event_type"))
         )

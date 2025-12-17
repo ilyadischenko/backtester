@@ -3,7 +3,7 @@
 import polars as pl
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-from matplotlib.patches import Rectangle
+from matplotlib.patches import Rectangle, Patch
 from datetime import datetime, timedelta
 from pathlib import Path
 from dataclasses import dataclass
@@ -24,7 +24,7 @@ class IntegrityReport:
     ob_total_rows: int = 0
     ob_expected_hours: int = 0
     ob_actual_hours: int = 0
-    ob_gaps: list = None  # Список пропусков
+    ob_gaps: list = None
     ob_max_gap_ms: int = 0
     ob_avg_update_ms: float = 0
     
@@ -36,8 +36,8 @@ class IntegrityReport:
     tr_max_gap_ms: int = 0
     
     # Аномалии
-    ob_price_anomalies: int = 0  # spread < 0 или слишком большой
-    tr_price_anomalies: int = 0  # цена вне bid-ask
+    ob_price_anomalies: int = 0
+    tr_price_anomalies: int = 0
     
     def __post_init__(self):
         if self.ob_gaps is None:
@@ -75,7 +75,7 @@ class IntegrityReport:
         is_ok = (
             self.ob_actual_hours == self.ob_expected_hours and
             self.tr_actual_hours == self.tr_expected_hours and
-            self.ob_max_gap_ms < 60000 and  # Нет пропусков > 1 мин
+            self.ob_max_gap_ms < 60000 and
             self.ob_price_anomalies == 0
         )
         
@@ -100,9 +100,9 @@ class DataIntegrityChecker:
     
     def __init__(
         self,
-        gap_threshold_ob_ms: int = 1000,    # Порог пропуска для orderbook (1 сек)
-        gap_threshold_tr_ms: int = 5000,    # Порог пропуска для trades (5 сек)
-        max_spread_pct: float = 0.05,       # Макс. спред 5%
+        gap_threshold_ob_ms: int = 1000,
+        gap_threshold_tr_ms: int = 5000,
+        max_spread_pct: float = 0.05,
     ):
         self.gap_threshold_ob_ms = gap_threshold_ob_ms
         self.gap_threshold_tr_ms = gap_threshold_tr_ms
@@ -167,15 +167,8 @@ class DataIntegrityChecker:
     
     def _check_orderbook(self, df: pl.DataFrame, report: IntegrityReport):
         """Проверка orderbook данных"""
-        
-        # Переименовываем колонки
-        df = df.rename({
-            "column_1": "event_time",
-            "column_3": "bid_price",
-            "column_4": "bid_size",
-            "column_5": "ask_price",
-            "column_6": "ask_size",
-        })
+        # Колонки уже именованы в DataManager:
+        # event_time, update_id, bid_price, bid_qty, ask_price, ask_qty
         
         report.ob_total_rows = len(df)
         
@@ -206,7 +199,7 @@ class DataIntegrityChecker:
         
         # Проверка аномалий цен
         anomalies = df.filter(
-            (pl.col("bid_price") >= pl.col("ask_price")) |  # Отрицательный спред
+            (pl.col("bid_price") >= pl.col("ask_price")) |
             (pl.col("bid_price") <= 0) |
             (pl.col("ask_price") <= 0) |
             ((pl.col("ask_price") - pl.col("bid_price")) / pl.col("bid_price") > self.max_spread_pct)
@@ -215,13 +208,8 @@ class DataIntegrityChecker:
     
     def _check_trades(self, df: pl.DataFrame, report: IntegrityReport, ob_df: pl.DataFrame = None):
         """Проверка trades данных"""
-        
-        df = df.rename({
-            "column_1": "event_time",
-            "column_3": "price",
-            "column_4": "quantity",
-            "column_6": "is_maker",
-        })
+        # Колонки уже именованы в DataManager:
+        # event_time, trade_id, price, qty, trade_time, is_maker
         
         report.tr_total_rows = len(df)
         
@@ -247,12 +235,83 @@ class DataIntegrityChecker:
                     "duration_ms": int(diffs[idx]),
                 })
     
+    def print_data_sample(
+        self,
+        data: MarketData,
+        n_rows: int = 10,
+        show_head: bool = True,
+        show_tail: bool = True,
+    ):
+        """Вывод примеров данных в консоль"""
+        
+        print("\n" + "=" * 80)
+        print("📋 ПРИМЕРЫ ДАННЫХ")
+        print("=" * 80)
+        
+        # Orderbook
+        if data.orderbook is not None and len(data.orderbook) > 0:
+            print("\n📗 ORDERBOOK")
+            print("-" * 80)
+            print(f"Колонки: {data.orderbook.columns}")
+            print(f"Типы: {data.orderbook.dtypes}")
+            print()
+            
+            if show_head:
+                print(f"Первые {n_rows} строк:")
+                print(data.orderbook.head(n_rows))
+            
+            if show_tail:
+                print(f"\nПоследние {n_rows} строк:")
+                print(data.orderbook.tail(n_rows))
+            
+            # Статистика
+            print("\nСтатистика:")
+            print(data.orderbook.select([
+                pl.col("bid_price").min().alias("bid_min"),
+                pl.col("bid_price").max().alias("bid_max"),
+                pl.col("ask_price").min().alias("ask_min"),
+                pl.col("ask_price").max().alias("ask_max"),
+            ]))
+        else:
+            print("\n⚠️ Orderbook: нет данных")
+        
+        # Trades
+        if data.trades is not None and len(data.trades) > 0:
+            print("\n📕 TRADES")
+            print("-" * 80)
+            print(f"Колонки: {data.trades.columns}")
+            print(f"Типы: {data.trades.dtypes}")
+            print()
+            
+            if show_head:
+                print(f"Первые {n_rows} строк:")
+                print(data.trades.head(n_rows))
+            
+            if show_tail:
+                print(f"\nПоследние {n_rows} строк:")
+                print(data.trades.tail(n_rows))
+            
+            # Статистика
+            print("\nСтатистика:")
+            print(data.trades.select([
+                pl.col("price").min().alias("price_min"),
+                pl.col("price").max().alias("price_max"),
+                pl.col("price").mean().alias("price_avg"),
+                pl.col("qty").sum().alias("total_qty"),
+                pl.col("is_maker").sum().alias("maker_trades"),
+                (pl.len() - pl.col("is_maker").sum()).alias("taker_trades"),
+            ]))
+        else:
+            print("\n⚠️ Trades: нет данных")
+        
+        print("\n" + "=" * 80)
+    
     def plot(
         self,
         data: MarketData,
         report: IntegrityReport,
-        resample_ms: int = 1000,  # Ресемплинг для читаемости
-        max_trades: int = 5000,   # Макс. трейдов для отображения
+        resample_ms: int = 1000,
+        max_trades: int = 5000,
         figsize: tuple = (16, 10),
     ):
         """Визуализация данных"""
@@ -272,18 +331,14 @@ class DataIntegrityChecker:
         ax1 = axes[0]
         
         if data.orderbook is not None:
-            ob = data.orderbook.rename({
-                "column_1": "event_time",
-                "column_3": "bid_price",
-                "column_5": "ask_price",
-            }).sort("event_time")
+            ob = data.orderbook.sort("event_time")
             
             # Конвертируем в datetime
             times = [datetime.fromtimestamp(t / 1000) for t in ob["event_time"].to_list()]
             bids = ob["bid_price"].to_numpy()
             asks = ob["ask_price"].to_numpy()
             
-            # Ресемплинг для скорости (берём каждый N-й)
+            # Ресемплинг для скорости
             step = max(1, len(times) // 10000)
             times = times[::step]
             bids = bids[::step]
@@ -295,12 +350,7 @@ class DataIntegrityChecker:
         
         # Trades как точки
         if data.trades is not None:
-            tr = data.trades.rename({
-                "column_1": "event_time",
-                "column_3": "price",
-                "column_4": "quantity",
-                "column_6": "is_maker",
-            }).sort("event_time")
+            tr = data.trades.sort("event_time")
             
             # Ограничиваем количество
             if len(tr) > max_trades:
@@ -311,7 +361,7 @@ class DataIntegrityChecker:
             tr_prices = tr["price"].to_numpy()
             tr_is_maker = tr["is_maker"].to_numpy()
             
-            # Buy = maker был продавец (is_maker=True = seller was maker = buy)
+            # Buy = maker был продавец (is_maker=1 = buyer is maker)
             buy_mask = tr_is_maker.astype(bool)
             sell_mask = ~buy_mask
             
@@ -337,11 +387,7 @@ class DataIntegrityChecker:
         ax2 = axes[1]
         
         if data.orderbook is not None:
-            ob = data.orderbook.rename({
-                "column_1": "event_time",
-                "column_3": "bid_price",
-                "column_5": "ask_price",
-            }).sort("event_time")
+            ob = data.orderbook.sort("event_time")
             
             times = [datetime.fromtimestamp(t / 1000) for t in ob["event_time"].to_list()]
             spread_pct = ((ob["ask_price"] - ob["bid_price"]) / ob["bid_price"] * 100).to_numpy()
@@ -381,17 +427,14 @@ class DataIntegrityChecker:
         
         # Update frequency
         if data.orderbook is not None:
-            ob = data.orderbook.rename({"column_1": "event_time"}).sort("event_time")
+            ob = data.orderbook.sort("event_time")
             times_arr = ob["event_time"].to_numpy()
             
             if len(times_arr) > 1:
-                diffs = np.diff(times_arr)
-                
-                # Группируем по секундам для графика
-                bucket_size = 1000  # 1 секунда
+                # Группируем по секундам
+                bucket_size = 1000
                 buckets = times_arr[:-1] // bucket_size
                 
-                # Считаем апдейтов в секунду
                 unique_buckets, counts = np.unique(buckets, return_counts=True)
                 bucket_times = [datetime.fromtimestamp(b * bucket_size / 1000) for b in unique_buckets]
                 
@@ -402,8 +445,7 @@ class DataIntegrityChecker:
         ax3.grid(True, alpha=0.3)
         ax3.set_title('Data Frequency (Red = OB gaps, Orange = Trade gaps)', fontsize=10)
         
-        # Добавляем легенду для gaps
-        from matplotlib.patches import Patch
+        # Легенда для gaps
         legend_elements = [
             Patch(facecolor='#F44336', alpha=0.3, label=f'OB gap >{self.gap_threshold_ob_ms}ms'),
             Patch(facecolor='#FF9800', alpha=0.3, label=f'Trade gap >{self.gap_threshold_tr_ms}ms'),
@@ -431,23 +473,27 @@ def check_data(
     market_type: str = "futures",
     save_plot: str = None,
     show_plot: bool = True,
+    show_table: bool = True,
+    table_rows: int = 10,
 ):
     """
     Проверить целостность данных и показать визуализацию.
     
     Args:
-        exchange: "binance", "bybit"
+        exchange: "binance", "bybit", "gate"
         symbol: "btcusdt", "ethusdt"
         start_time: "2025-01-07 00:00:00"
         end_time: "2025-01-07 02:00:00"
         market_type: "futures" или "spot"
-        save_plot: путь для сохранения графика (опционально)
+        save_plot: путь для сохранения графика
         show_plot: показать график
+        show_table: показать таблицу с данными
+        table_rows: количество строк в таблице
     """
     checker = DataIntegrityChecker(
-        gap_threshold_ob_ms=1000,   # 1 секунда
-        gap_threshold_tr_ms=5000,   # 5 секунд
-        max_spread_pct=0.05,        # 5%
+        gap_threshold_ob_ms=1000,
+        gap_threshold_tr_ms=5000,
+        max_spread_pct=0.05,
     )
     
     report, data = checker.check(
@@ -459,6 +505,10 @@ def check_data(
     )
     
     report.print_report()
+    
+    # Показать таблицу с данными
+    if show_table:
+        checker.print_data_sample(data, n_rows=table_rows)
     
     fig = checker.plot(data, report)
     
@@ -478,11 +528,13 @@ def check_data(
 
 if __name__ == "__main__":
     report, data, fig = check_data(
-        exchange="binance",
-        symbol="pippinusdt",
-        start_time="2025-12-09 10:00:00",
-        end_time="2025-12-09 14:00:00",
+        exchange="gate",
+        symbol="btcusdt",
+        start_time="2025-12-17 10:00:00",
+        end_time="2025-12-17 15:00:00",
         market_type="futures",
         save_plot="data_integrity_check.png",
         show_plot=True,
+        show_table=True,
+        table_rows=10,
     )

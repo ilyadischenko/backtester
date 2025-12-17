@@ -3,16 +3,16 @@ import cProfile
 import pstats
 import time
 
-from core.fast_iterator import run_fast
+from fast_iterator import run_fast
 
 profiler = cProfile.Profile()
 profiler.enable()
 
 
-from core.engine import ExchangeEngine
+from engine import ExchangeEngine
 # from strategies.test_strategy import  MarketMakerStrategy
 from strategies.knife_catcher import KnifeCatcherUltraFast
-from core.visualization import BacktestVisualizer
+from visualization import BacktestVisualizer
 
 # Твой data manager
 from data.data_manager import dataManager
@@ -24,10 +24,10 @@ from data.data_manager import dataManager
 # Загрузка данных
 # ═══════════════════════════════════════════════════════════
 df = dataManager.load_timerange(
-    exchange="binance",
-    symbol="pippinusdt",
-    start_time="2025-12-10 10:00",
-    end_time="2025-12-10 15:00",  # 2 часа для теста
+    exchange="gate",
+    symbol="btcusdt",
+    start_time="2025-12-17 11:00",
+    end_time="2025-12-17 11:00",  # 2 часа для теста
     data_type="all",
     market_type="futures"
 )
