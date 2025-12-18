@@ -162,7 +162,7 @@ class DataIntegrityChecker:
             self._check_trades(data.trades, report, data.orderbook)
         else:
             print("⚠️  Trades данные отсутствуют!")
-        
+        print(data.trades)
         return report, data
     
     def _check_orderbook(self, df: pl.DataFrame, report: IntegrityReport):
@@ -538,3 +538,4 @@ if __name__ == "__main__":
         show_table=True,
         table_rows=10,
     )
+

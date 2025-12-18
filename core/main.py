@@ -1,17 +1,21 @@
 
-import cProfile
+# import cProfile
 import pstats
 import time
 
 from fast_iterator import run_fast
 
-profiler = cProfile.Profile()
-profiler.enable()
+# profiler = cProfile.Profile()
+# profiler.enable()
 
 
 from engine import ExchangeEngine
 # from strategies.test_strategy import  MarketMakerStrategy
 from strategies.knife_catcher import KnifeCatcherUltraFast
+
+from strategies.test_strategy import AvellanedaStoikovMMNew
+from strategies.stoikov import AvellanedaStoikovMM
+
 from visualization import BacktestVisualizer
 
 # Твой data manager
@@ -24,10 +28,10 @@ from data.data_manager import dataManager
 # Загрузка данных
 # ═══════════════════════════════════════════════════════════
 df = dataManager.load_timerange(
-    exchange="gate",
-    symbol="btcusdt",
-    start_time="2025-12-17 11:00",
-    end_time="2025-12-17 11:00",  # 2 часа для теста
+    exchange="binance",
+    symbol="pieverseusdt",
+    start_time="2025-12-12 10:00",
+    end_time="2025-12-12 20:00",  # 2 часа для теста
     data_type="all",
     market_type="futures"
 )
@@ -38,43 +42,43 @@ def main():
     bookticker = df.orderbook
     trades = df.trades
 
-    # strategy = MarketMakerStrategy(
-    #     initial_balance=1000.0,
-    #     order_size_usd=10.0,
-    #     spread_bps=5.0,
-    #     max_position_usd=500.0,
-    #     refresh_interval_ms=1000,
-    # )
-
-    strategy = KnifeCatcherUltraFast(
-        # initial_balance  = 10000.0,
-
-        market_order_size_usd  = 100.0,  # Маркет при входе
-        limit_order_1_size_usd  = 100.0,  # Первая лимитка
-        limit_order_2_size_usd = 100.0,  # Вторая лимитка
-
-        volatility_window_sec = 30.0,  # Окно расчёта текущей волатильности
-        volatility_spike_pct = 150.0,  # Порог: волатильность > средней на X%
-        volatility_lookback_sec = 300.0,  # Период для средней волатильности
-
-        imbalance_window_sec = 5.0,  # Окно расчёта дисбаланса
-        imbalance_sell_threshold = 0.65,  # Порог: sells > 65% = нож
-        imbalance_neutral_threshold = 0.55,  # Порог: sells < 55% = затихание
-
-
-        calm_window_sec = 2.0,  # Окно для определения затихания
-        calm_price_change_bps = 5.0,  # Макс изменение цены для "спокойствия"
-        min_knife_duration_sec = 1.0,  # Мин длительность ножа
-        max_knife_duration_sec = 60.0,  # Макс ожидание затихания
-
-        limit_order_1_offset_bps = 20.0,  # Первая лимитка ниже на X bps
-        limit_order_2_offset_bps = 40.0,  # Вторая лимитка ниже на X bps
-        stop_loss_bps = 60.0,  # Стоп ниже средней на X bps
-        take_profit_bps = 30.0,  # Тейк выше средней на X bps
-
-        cooldown_after_close_sec = 10.0,  # Пауза после закрытия
-        min_data_points = 100,  # Мин точек для старта
+    strategy = AvellanedaStoikovMMNew(
+        # initial_balance=1000.0,
+        # order_size_usd=10.0,
+        # spread_bps=5.0,
+        # max_position_usd=500.0,
+        # refresh_interval_ms=1000,
     )
+
+    # strategy = KnifeCatcherUltraFast(
+    #     # initial_balance  = 10000.0,
+
+    #     market_order_size_usd  = 100.0,  # Маркет при входе
+    #     limit_order_1_size_usd  = 100.0,  # Первая лимитка
+    #     limit_order_2_size_usd = 100.0,  # Вторая лимитка
+
+    #     volatility_window_sec = 30.0,  # Окно расчёта текущей волатильности
+    #     volatility_spike_pct = 150.0,  # Порог: волатильность > средней на X%
+    #     volatility_lookback_sec = 300.0,  # Период для средней волатильности
+
+    #     imbalance_window_sec = 5.0,  # Окно расчёта дисбаланса
+    #     imbalance_sell_threshold = 0.65,  # Порог: sells > 65% = нож
+    #     imbalance_neutral_threshold = 0.55,  # Порог: sells < 55% = затихание
+
+
+    #     calm_window_sec = 2.0,  # Окно для определения затихания
+    #     calm_price_change_bps = 5.0,  # Макс изменение цены для "спокойствия"
+    #     min_knife_duration_sec = 1.0,  # Мин длительность ножа
+    #     max_knife_duration_sec = 60.0,  # Макс ожидание затихания
+
+    #     limit_order_1_offset_bps = 20.0,  # Первая лимитка ниже на X bps
+    #     limit_order_2_offset_bps = 40.0,  # Вторая лимитка ниже на X bps
+    #     stop_loss_bps = 60.0,  # Стоп ниже средней на X bps
+    #     take_profit_bps = 30.0,  # Тейк выше средней на X bps
+
+    #     cooldown_after_close_sec = 10.0,  # Пауза после закрытия
+    #     min_data_points = 100,  # Мин точек для старта
+    # )
 
 
     engine = ExchangeEngine(
@@ -100,6 +104,7 @@ def main():
     # Визуализируем
     viz = BacktestVisualizer(engine)
     viz.show("My Backtest")
+    print(len(engine.orders))
 
 
     # print("\n" + "="*70)
@@ -131,8 +136,8 @@ def main():
 if __name__ == "__main__":
     main()
 
-    profiler.disable()
-    stats = pstats.Stats(profiler)
-    stats.sort_stats('cumulative')
-    stats.print_stats(20)  # Топ-20 медленных функций
+    # profiler.disable()
+    # stats = pstats.Stats(profiler)
+    # stats.sort_stats('cumulative')
+    # stats.print_stats(20)  # Топ-20 медленных функций
 

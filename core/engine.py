@@ -70,39 +70,16 @@ class ExchangeEngine:
         self.orders: List[Order] = []
         self.positions: List[Position] = []
 
+        # Только активные (ещё не исполненные/не отменённые) ордера
+        self.active_orders: Dict[int, Order] = {}
+        # Быстрый доступ по id ко всем ордерам (для cancel, визуализатора и т.п.)
+        self.orders_by_id: Dict[int, Order] = {}
+
         self.last_event_time: int = 0
         self.last_bookticker: Dict = {}
         self.last_trade: Dict = {}
 
-    # def _parse_bookticker(self, df):
-    #     if df is None:
-    #         return pl.DataFrame()
-    #     return (
-    #         df.rename({
-    #             "column_1": "event_time",
-    #             "column_2": "event_id",
-    #             "column_3": "bid_price",
-    #             "column_4": "bid_size",
-    #             "column_5": "ask_price",
-    #             "column_6": "ask_size",
-    #         })
-    #         .with_columns(pl.lit("bookticker").alias("event_type"))
-    #     )
 
-    # def _parse_trades(self, df):
-    #     if df is None:
-    #         return pl.DataFrame()
-    #     return (
-    #         df.rename({
-    #             "column_1": "event_time",
-    #             "column_2": "event_id",
-    #             "column_3": "price",
-    #             "column_4": "quantity",
-    #             "column_5": "time",
-    #             "column_6": "is_maker",
-    #         })
-    #         .with_columns(pl.lit("trade").alias("event_type"))
-    #     )
 
     def _prepare_bookticker(self, df: pl.DataFrame) -> pl.DataFrame:
         """
@@ -196,7 +173,7 @@ class ExchangeEngine:
                 continue
 
             if req["action"] == "place":
-                self.orders.append(Order(
+                order = Order(
                     id=req["id"],
                     price=req["price"],
                     size=req["size"],
@@ -204,13 +181,17 @@ class ExchangeEngine:
                     created_time=req["send_time"],
                     exchange_time=arrival,
                     status="new",
-                ))
+                )
+                # Полная история ордеров (для визуализации и отчётов)
+                self.orders.append(order)
+                self.orders_by_id[order.id] = order
+                # Активные ордера для исполнения
+                self.active_orders[order.id] = order
 
             elif req["action"] == "cancel":
-                for o in self.orders:
-                    if o.id == req["id"] and o.cancel_requested_at is None:
-                        o.cancel_requested_at = arrival  # ✅ Записываем время!
-                        break
+                order = self.orders_by_id.get(req["id"])
+                if order is not None and order.cancel_requested_at is None:
+                    order.cancel_requested_at = arrival
     # ═══════════════════════════════════════════════════════════
     # ORDER EXECUTION
     # ═══════════════════════════════════════════════════════════
@@ -222,41 +203,41 @@ class ExchangeEngine:
         bid = self.last_bookticker["bid_price"]
         ask = self.last_bookticker["ask_price"]
 
-        for order in self.orders:
-            if order.status != "new":
-                continue
+        # Делаем список, чтобы можно было модифицировать active_orders внутри цикла
+        for order in list(self.active_orders.values()):
             if order.exchange_time > self.last_event_time:
                 continue
 
-            # ─────────────────────────────────────────────────
-            # Race condition: cancel дошёл ДО этого тика — отменяем
-            # ─────────────────────────────────────────────────
+            # cancel дошёл до биржи до текущего тика
             if (order.cancel_requested_at is not None 
                 and order.cancel_requested_at < self.last_event_time):
                 order.status = "canceled"
+                # убираем из активных
+                self.active_orders.pop(order.id, None)
                 continue
 
             just_placed = order.exchange_time == self.last_event_time
 
-            # ─────────────────────────────────────────────────
-            # MARKET ORDER
-            # ─────────────────────────────────────────────────
             if order.type == "market":
                 exec_price = ask if order.size > 0 else bid
                 self._fill_order(order, exec_price, is_maker=False)
+                # ордер исполнен — убираем из активных
+                self.active_orders.pop(order.id, None)
                 continue
 
-            # ─────────────────────────────────────────────────
-            # LIMIT ORDER
-            # ─────────────────────────────────────────────────
             if order.type == "limit":
                 filled = self._try_fill_limit_order(order, bid, ask, just_placed)
 
-                # Race condition: cancel в ЭТОМ тике, но fill не случился
-                if (not filled 
-                    and order.cancel_requested_at is not None
+                if filled:
+                    # лимитка исполнена — убираем из активных
+                    self.active_orders.pop(order.id, None)
+                    continue
+
+                # cancel в этот тик и fill не было
+                if (order.cancel_requested_at is not None
                     and order.cancel_requested_at <= self.last_event_time):
                     order.status = "canceled"
+                    self.active_orders.pop(order.id, None)
 
     def _try_fill_limit_order(
         self, order: Order, bid: float, ask: float, just_placed: bool

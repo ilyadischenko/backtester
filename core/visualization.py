@@ -1,4 +1,6 @@
 # visualizer.py
+import math
+from typing import Dict
 from bokeh.plotting import figure, show, output_file
 from bokeh.models import (
     ColumnDataSource, HoverTool, Span, LabelSet, CustomJS, Button, Div
@@ -41,9 +43,9 @@ class BacktestVisualizer:
         self._apply_dark_theme(p)
 
         p.line(x='time', y='bid_price', source=source,
-               legend_label="Bid", line_width=2, color="#00e676", alpha=0.9)
+               legend_label="Bid", line_width=2, color="#006132", alpha=0.9)
         p.line(x='time', y='ask_price', source=source,
-               legend_label="Ask", line_width=2, color="#ff5252", alpha=0.9)
+               legend_label="Ask", line_width=2, color="#6b1f1f", alpha=0.9)
 
         # Сделки из движка
         buys, sells = self._get_trades()
@@ -74,12 +76,12 @@ class BacktestVisualizer:
         # ══════════════════════════════════════════════════════
         ruler_controls = self._add_ruler_tool(p, pdf)
 
-        hover_price = HoverTool(tooltips=[
-            ("Time", "@time{%F %T}"),
-            ("Bid", "@bid_price{0.00000}"),
-            ("Ask", "@ask_price{0.00000}"),
-        ], formatters={'@time': 'datetime'}, mode='vline')
-        p.add_tools(hover_price)
+        # hover_price = HoverTool(tooltips=[
+        #     ("Time", "@time{%F %T}"),
+        #     ("Bid", "@bid_price{0.00000}"),
+        #     ("Ask", "@ask_price{0.00000}"),
+        # ], formatters={'@time': 'datetime'}, mode='vline')
+        # p.add_tools(hover_price)
 
         p.legend.location = "top_left"
         p.legend.background_fill_alpha = 0.5
@@ -440,30 +442,155 @@ class BacktestVisualizer:
 
     def _draw_positions(self, fig):
         """
-        Рисует горизонтальные линии для каждой позиции.
+        Рисует позиции:
+        - горизонтальные сегменты среднего входа;
+        - вертикальные соединения между сегментами одной позиции (смена средней / переворот);
+        - X‑маркер в конце последнего сегмента (закрытие позиции).
         """
-        for position in self.engine.positions:
-            segments = self._build_position_segments(position)
+        segments_all = []
+        by_pos: Dict[int, list] = {}
 
-            if not segments:
+        # Собираем все сегменты всех позиций
+        for position in self.engine.positions:
+            segs = self._build_position_segments(position)
+            if not segs:
                 continue
 
-            color = "#00bcd4" if position.size >= 0 else "#ff9800"
+            for seg in segs:
+                start_dt = pd.to_datetime(seg['start_time'], unit='ms')
+                end_dt = pd.to_datetime(seg['end_time'], unit='ms')
 
-            for segment in segments:
-                x0 = pd.to_datetime(segment['start_time'], unit='ms')
-                x1 = pd.to_datetime(segment['end_time'], unit='ms')
-                y = segment['price']
+                color = "#00e676" if seg['side'] == "long" else "#ff9800"
 
-                fig.segment(
-                    x0=x0, y0=y, x1=x1, y1=y,
-                    line_width=2, color=color, alpha=0.7,
-                    line_dash='dashed'
-                )
+                seg_dict = {
+                    # геометрия
+                    'x0': start_dt,
+                    'y0': seg['price'],
+                    'x1': end_dt,
+                    'y1': seg['price'],
+                    'color': color,
 
+                    # данные о позиции
+                    'pos_id': position.id,
+                    'status': position.status,
+                    'side': seg['side'],
+                    'seg_size': seg['size'],
+                    'avg_price_seg': seg['price'],          # средняя в этом сегменте
+                    'entry_price_pos': position.price,      # общая средняя позиции
+                    'open_time_pos': pd.to_datetime(position.open_time, unit='ms'),
+                    'close_time_pos': (
+                        pd.to_datetime(position.close_time, unit='ms')
+                        if position.close_time is not None else pd.NaT
+                    ),
+                    'realized_pnl': position.realized_pnl,
+                    'fees': position.fees,
+                    'net_pnl': position.net_pnl,
+
+                    # флаг "это последний сегмент позиции"
+                    'is_close': False,
+                }
+
+                segments_all.append(seg_dict)
+                by_pos.setdefault(position.id, []).append(seg_dict)
+
+        if not segments_all:
+            return
+
+        # Помечаем последний сегмент каждой позиции как "закрытие"
+        connectors = []
+        for pos_id, segs in by_pos.items():
+            segs_sorted = sorted(segs, key=lambda s: s['x0'])
+            # последний сегмент — там позиция заканчивается
+            segs_sorted[-1]['is_close'] = True
+
+            # вертикальные соединения между сегментами этой позиции
+            for i in range(1, len(segs_sorted)):
+                prev_seg = segs_sorted[i - 1]
+                curr_seg = segs_sorted[i]
+
+                connectors.append({
+                    'x': curr_seg['x0'],
+                    'y0': prev_seg['y0'],
+                    'y1': curr_seg['y0'],
+                    'color': curr_seg['color'],
+                    'pos_id': pos_id,
+                })
+
+        # --- рисуем сегменты ---
+        seg_df = pd.DataFrame(segments_all)
+        seg_source = ColumnDataSource(seg_df)
+
+        seg_renderer = fig.segment(
+            x0='x0', y0='y0', x1='x1', y1='y1',
+            source=seg_source,
+            line_width=3,
+            color='color',
+            alpha=0.9,
+        )
+
+        # точки на старте каждого сегмента (открытие/изменение средней)
+        fig.circle(
+            x='x0', y='y0',
+            source=seg_source,
+            size=6,
+            color='color',
+            alpha=0.9,
+        )
+
+        # X‑маркер в конце последнего сегмента (где позиция закрылась)
+        close_df = seg_df[seg_df['is_close']]
+        if not close_df.empty:
+            close_source = ColumnDataSource(close_df)
+            fig.scatter(
+                x='x1', y='y1',
+                source=close_source,
+                marker='x',
+                size=10,
+                line_color='color',
+                fill_color=None,
+                line_width=2,
+                alpha=0.9,
+            )
+
+        # --- вертикальные соединения между сегментами ---
+        if connectors:
+            conn_df = pd.DataFrame(connectors)
+            conn_source = ColumnDataSource(conn_df)
+            fig.segment(
+                x0='x', y0='y0', x1='x', y1='y1',
+                source=conn_source,
+                line_width=2,
+                color='color',
+                alpha=0.9,
+            )
+
+        # Hover по сегментам (позиционная информация)
+        hover_pos = HoverTool(
+            renderers=[seg_renderer],
+            tooltips=[
+                ("Position ID", "@pos_id"),
+                ("Status", "@status"),
+                ("Side", "@side"),
+                ("Segment size", "@seg_size{0.0000}"),
+                ("Segment price", "@avg_price_seg{0.0000}"),
+                ("Pos avg price", "@entry_price_pos{0.0000}"),
+                ("Pos open", "@open_time_pos{%F %T}"),
+                ("Pos close", "@close_time_pos{%F %T}"),
+                ("Realized PnL", "@realized_pnl{0,0.00}"),
+                ("Fees", "@fees{0,0.00}"),
+                ("Net PnL", "@net_pnl{0,0.00}"),
+            ],
+            formatters={
+                '@open_time_pos': 'datetime',
+                '@close_time_pos': 'datetime',
+            },
+            mode='mouse',
+        )
+        fig.add_tools(hover_pos)  
     def _build_position_segments(self, position):
         """
         Строит сегменты горизонтальных линий для позиции.
+        Каждый сегмент: период времени, когда средняя цена и знак позиции постоянны.
         """
         position_orders = [
             o for o in self.engine.orders
@@ -479,22 +606,27 @@ class BacktestVisualizer:
         current_price = 0.0
         segment_start_time = position_orders[0].fill_time
 
-        for i, order in enumerate(position_orders):
+        for order in position_orders:
             old_size = abs(current_size)
             trade_size = order.size
             trade_abs = abs(trade_size)
 
+            # Открытие новой позиции (до этого size = 0)
             if abs(current_size) < 1e-12:
                 current_size = trade_size
                 current_price = order.fill_price
                 segment_start_time = order.fill_time
                 continue
 
+            # Усреднение (увеличение в ту же сторону)
             if current_size * trade_size > 0:
+                side_label = "long" if current_size > 0 else "short"
                 segments.append({
                     'start_time': segment_start_time,
                     'end_time': order.fill_time,
-                    'price': current_price
+                    'price': current_price,
+                    'side': side_label,
+                    'size': abs(current_size),
                 })
 
                 old_notional = old_size * current_price
@@ -506,44 +638,62 @@ class BacktestVisualizer:
                 segment_start_time = order.fill_time
                 continue
 
+            # Противоположная сделка: частичное/полное закрытие или переворот
             closed_qty = min(old_size, trade_abs)
 
+            # Частичное закрытие — размер позиции уменьшается, цена не меняется
             if trade_abs < old_size - 1e-12:
                 current_size += trade_size
+                # сегмент продолжается, цена та же, просто размер меньше
                 continue
 
+            # Полное закрытие
             if abs(trade_abs - old_size) < 1e-12:
+                side_label = "long" if current_size > 0 else "short"
                 segments.append({
                     'start_time': segment_start_time,
                     'end_time': order.fill_time,
-                    'price': current_price
+                    'price': current_price,
+                    'side': side_label,
+                    'size': abs(current_size),
                 })
                 current_size = 0.0
                 current_price = 0.0
+                # новый сегмент ещё не начинается, ждём следующую сделку
                 continue
 
+            # Переворот: сначала закрываем старую, потом открываем новую в другую сторону
             remaining = trade_abs - old_size
 
+            # сегмент старой позиции
+            side_label = "long" if current_size > 0 else "short"
             segments.append({
                 'start_time': segment_start_time,
                 'end_time': order.fill_time,
-                'price': current_price
+                'price': current_price,
+                'side': side_label,
+                'size': abs(current_size),
             })
 
-            current_size = trade_size / abs(trade_size) * remaining
+            # новая позиция в обратную сторону
+            current_size = math.copysign(remaining, trade_size)
             current_price = order.fill_price
             segment_start_time = order.fill_time
 
+        # Хвост: позиция осталась открытой до close_time или конца теста
         if abs(current_size) > 1e-12:
             end_time = position.close_time if position.status == "closed" else self.engine.last_event_time
+            side_label = "long" if current_size > 0 else "short"
             segments.append({
                 'start_time': segment_start_time,
                 'end_time': end_time,
-                'price': current_price
+                'price': current_price,
+                'side': side_label,
+                'size': abs(current_size),
             })
 
         return segments
-
+    
     def _build_equity_curve(self):
         """
         Строим equity curve.
