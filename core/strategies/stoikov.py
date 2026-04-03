@@ -1,231 +1,237 @@
-from typing import Dict
+from typing import Dict, Optional, List
 from collections import deque
-
+from dataclasses import dataclass
 import numpy as np
 from numba import njit
+from visualization.visualization import PlotRecorder
 
-# ═══════════════════════════════════════════════════════════════════
-# 1. NUMBA: волатильность по окну цен
-# ═══════════════════════════════════════════════════════════════════
+# --- Numba High-Performance Calc ---
 
 @njit(cache=True, fastmath=True, nogil=True)
-def calc_volatility_std(prices: np.ndarray) -> float:
-    n = prices.shape[0]
+def calc_volatility(prices: np.ndarray, window: int) -> float:
+    """
+    Считает волатильность как стандартное отклонение доходностей.
+    Очень быстро на массивах numpy.
+    """
+    n = len(prices)
     if n < 2:
         return 0.0
+    
+    # Берем последние N цен
+    if n > window:
+        subset = prices[-window:]
+    else:
+        subset = prices
+        
+    # Log returns: ln(p_t / p_{t-1}) ~ (p_t - p_{t-1}) / p_{t-1}
+    # Для скорости используем простую процентную разницу
+    diffs = np.diff(subset)
+    means = subset[:-1]
+    returns = diffs / means
+    
+    std_dev = np.std(returns)
+    return std_dev
 
-    mean = 0.0
-    for i in range(n):
-        mean += prices[i]
-    mean /= n
+@njit(cache=True, fastmath=True, nogil=True)
+def calc_reservation_price(mid_price: float, inventory: float, 
+                           risk_aversion: float, vol: float) -> float:
+    """
+    Формула Avellaneda-Stoikov для Reservation Price.
+    r = s - q * gamma * sigma^2
+    Где:
+    s = mid price
+    q = inventory (inventory quantity)
+    gamma = risk aversion parameter
+    sigma = volatility
+    """
+    # Упрощенная линейная модель перекоса, более стабильная для крипты
+    # Сдвиг цены против позы, чтобы разгрузиться
+    skew = inventory * risk_aversion * (vol * mid_price) 
+    return mid_price - skew
 
-    var = 0.0
-    for i in range(n):
-        diff = prices[i] - mean
-        var += diff * diff
+# --- Strategy Class ---
 
-    var /= (n - 1)
-    return np.sqrt(var)
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 2. Avellaneda‑Stoikov MM для фьючей (лонг/шорт через знак size)
-# ═══════════════════════════════════════════════════════════════════
-
-class AvellanedaStoikovMM:
+class HFTMarketMaker:
     def __init__(
         self,
-        initial_balance: float = 1000.0,
-
-        # AS‑параметры
-        gamma: float = 0.5,
-        k_spread_multiplier: float = 5.0,
-
-        # Настройки
-        volatility_window_sec: float = 60.0,
-        min_spread_bps: float = 5.0,
-        max_inventory: float = 1000.0,
-
-        order_size: float = 100.0,
-        recalc_interval_ms: int = 1000,
-        quote_update_threshold_bps: float = 2.0,
-
-        min_data_points: int = 100,
+        # Настройки риска
+        risk_aversion: float = 0.5,    # Как сильно бояться инвентаря (Gamma)
+        order_amount: float = 100.0,   # Размер ордера в $ (или монетах)
+        max_position: float = 1000.0,  # Макс позиция
+        
+        # Настройки спреда
+        min_spread_pct: float = 0.04,  # Минимальный спред (половинка, % от цены)
+        vol_multiplier: float = 2.0,   # Множитель расширения спреда от волатильности
+        
+        # Настройки скорости
+        vol_window: int = 100,         # Окно тиков для расчета волатильности
+        requote_threshold_pct: float = 0.01, # Минимальное изменение цены для перестановки ордера (фильтр шума)
+        
+        # Имбаланс стакана
+        imbalance_weight: float = 0.2, # Вес влияния дисбаланса стакана на цену
     ):
-        self.initial_balance = initial_balance
-        self.gamma = gamma
-        self.k_spread = k_spread_multiplier
-        self.vol_window_ms = int(volatility_window_sec * 1000)
-
-        self.min_spread_bps = min_spread_bps
-        self.max_inventory = max_inventory
-
-        self.order_size = order_size
-        self.recalc_interval_ms = recalc_interval_ms
-        self.update_threshold = quote_update_threshold_bps
-        self.min_data_points = min_data_points
-
-        # Окно цен/времени (без большого буфера)
-        self.price_times = deque()
-        self.price_values = deque()
-
-        # Состояние
-        self.last_recalc_time = 0
-        self.sigma = 0.0
+        self.risk_aversion = risk_aversion
+        self.order_amount = order_amount
+        self.max_position = max_position
+        self.min_spread_pct = min_spread_pct / 100.0
+        self.vol_multiplier = vol_multiplier
+        self.vol_window = vol_window
+        self.requote_threshold_pct = requote_threshold_pct / 100.0
+        self.imbalance_weight = imbalance_weight
+        
+        # Данные (используем deque с maxlen для автоматического удаления старого)
+        self.mid_prices = deque(maxlen=2000) 
+        
+        # Текущее состояние
         self.mid_price = 0.0
-
-        # Активные ордера: логический side -> order_id
-        self.active_orders: Dict[str, int] = {}
-        self.last_quote_prices: Dict[str, float] = {"buy": 0.0, "sell": 0.0}
-
+        self.volatility = 0.0
+        self.inventory = 0.0
+        self.book_imbalance = 0.0 # От -1 (продавцы) до 1 (покупатели)
+        
+        # Активные ордера
+        self.bid_oid: Optional[int] = None
+        self.ask_oid: Optional[int] = None
+        self.active_bid_price = 0.0
+        self.active_ask_price = 0.0
+        
+        self.plot = PlotRecorder()
+        
         # Прогрев Numba
-        _ = calc_volatility_std(np.zeros(2, dtype=np.float64))
+        _p = np.array([100.0, 101.0, 100.5], dtype=np.float64)
+        calc_volatility(_p, 10)
+        calc_reservation_price(100.0, 1.0, 0.1, 0.01)
 
-    # ==================================================================
-    #  Основной хук из движка
-    # ==================================================================
     def on_tick(self, event, engine):
-        current_time = event["event_time"]
-
-        # 1) обновляем mid и окно цен
-        if event.get("event_type") == "bookticker":
+        t = event["event_time"]
+        etype = event.get("event_type")
+        
+        # 1. Обработка BookTicker (самое важное для MM)
+        if etype == "bookticker":
             bid = event["bid_price"]
             ask = event["ask_price"]
-            self.mid_price = 0.5 * (bid + ask)
-
-            self.price_times.append(current_time)
-            self.price_values.append(self.mid_price)
-
-            cutoff = current_time - self.vol_window_ms
-            while self.price_times and self.price_times[0] < cutoff:
-                self.price_times.popleft()
-                self.price_values.popleft()
-
-        # Ждём достаточного количества точек
-        if len(self.price_values) < self.min_data_points:
-            return
-
-        # 2) раз в recalc_interval_ms пересчитываем котировки
-        if current_time - self.last_recalc_time >= self.recalc_interval_ms:
-            pos = self._get_position(engine)
-            inventory = pos.size if pos else 0.0  # >0 лонг, <0 шорт (фьючи)
-
-            prices_np = np.array(self.price_values, dtype=np.float64)
-            self.sigma = calc_volatility_std(prices_np)
-
-            if self.sigma > 0.0 and self.mid_price > 0.0:
-                self._update_quotes(engine, inventory)
-
-            self.last_recalc_time = current_time
-
-    # ==================================================================
-    #  Avellaneda‑Stoikov логика
-    # ==================================================================
-    def _update_quotes(self, engine, inventory: float):
-        """
-        inventory > 0 -> лонг
-        inventory < 0 -> шорт
-        Лимит по модулю в USD.
-        """
-        # 1) reservation price
-        reservation_price = self.mid_price - (inventory * self.gamma * (self.sigma ** 2))
-
-        # 2) ширина спреда
-        half_spread = 0.5 * self.sigma * self.k_spread
-        min_half_spread = self.mid_price * (self.min_spread_bps / 10000.0) / 2.0
-        half_spread = max(half_spread, min_half_spread)
-
-        # 3) целевые цены
-        target_bid = reservation_price - half_spread
-        target_ask = reservation_price + half_spread
-
-        # 4) риск по инвентарю (симметрично для лонга/шорта)
-        current_inv = inventory
-        # current_inv = inventory * self.mid_price
-
-        allow_buy = current_inv < self.max_inventory
-        allow_sell = current_inv > -self.max_inventory
-
-        # 5) управление ордерами
-        self._manage_order_side(engine, "buy", target_bid, allow_buy)
-        self._manage_order_side(engine, "sell", target_ask, allow_sell)
-
-    # ==================================================================
-    #  Работа с ордерами (логический side -> знак size)
-    # ==================================================================
-    def _manage_order_side(self, engine, side: str, target_price: float, allow: bool):
-        order_id = self.active_orders.get(side)
-
-        # Если сторону торговать нельзя — отменяем существующий ордер
-        if not allow:
-            if order_id:
-                self._cancel_order(engine, side)
-            return
-
-        # Ордера нет — просто ставим
-        if not order_id:
-            self._place_order(engine, side, target_price)
-            return
-
-        current_price = self.last_quote_prices.get(side, 0.0)
-        if current_price == 0.0:
-            return
-
-        diff_bps = abs(target_price - current_price) / current_price * 10000.0
-
-        if diff_bps > self.update_threshold:
-            existing_order = self._find_order(engine, order_id)
-
-            if existing_order and existing_order.status == "filled":
-                self.active_orders.pop(side, None)
-                self._place_order(engine, side, target_price)
+            bid_qty = event["bid_size"]
+            ask_qty = event["ask_size"]
+            
+            self.mid_price = (bid + ask) / 2
+            self.mid_prices.append(self.mid_price)
+            
+            # Расчет дисбаланса (Order Book Imbalance)
+            # Если бидов больше -> imbalance > 0 -> цена скорее пойдет вверх
+            total_qty = bid_qty + ask_qty
+            if total_qty > 0:
+                self.book_imbalance = (bid_qty - ask_qty) / total_qty
             else:
-                self._cancel_order(engine, side)
-                self._place_order(engine, side, target_price)
+                self.book_imbalance = 0.0
+                
+            self._logic_cycle(engine, t)
+            
+        # 2. Обработка сделок (для обновления волатильности)
+        elif etype == "trade":
+            # Можно обновлять волатильность тут, но для скорости HFT 
+            # достаточно обновлять на bookticker, так как цена там тоже меняется
+            pass
 
-    def _place_order(self, engine, side: str, price: float):
-        """
-        ВАЖНО: в твоём ExchangeEngine направление задаётся знаком size:
-        - buy  -> size > 0
-        - sell -> size < 0
-        """
-        qty = self.order_size
-        if side == "sell":
-            qty = -qty
+    def _logic_cycle(self, engine, t: int):
+        """Основной цикл принятия решений"""
+        
+        # 0. Проверка готовности данных
+        if len(self.mid_prices) < 10:
+            return
 
-        # Простейшая защита от немедленного исполнения (псевдо post-only)
-        if side == "buy" and price > self.mid_price:
-            price = self.mid_price - 0.01
-        if side == "sell" and price < self.mid_price:
-            price = self.mid_price + 0.01
+        # 1. Получаем текущую позицию
+        pos = self._get_position(engine)
+        self.inventory = pos.size if pos else 0.0
+        
+        # 2. Считаем волатильность (быстро через Numba)
+        # Превращаем deque в numpy array только когда нужно
+        # (в реальном проде лучше держать numpy буфер, но для бэктеста deque ок)
+        price_arr = np.array(self.mid_prices, dtype=np.float64)
+        self.volatility = calc_volatility(price_arr, self.vol_window)
+        
+        # 3. Reservation Price (Сдвиг цены на основе инвентаря)
+        # Если у нас много лонга, res_price будет НИЖЕ mid_price
+        res_price = calc_reservation_price(
+            self.mid_price, 
+            self.inventory / self.order_amount, # Нормализуем инвентарь к размеру ордера
+            self.risk_aversion, 
+            self.volatility
+        )
+        
+        # 4. Учет микроструктуры (Imbalance)
+        # Если imbalance > 0 (давление покупателей), сдвигаем цену вверх
+        res_price += (self.book_imbalance * self.imbalance_weight * (self.mid_price * self.min_spread_pct))
+        
+        # 5. Расчет ширины спреда
+        # Базовый спред + расширение от волатильности
+        half_spread = (self.mid_price * self.min_spread_pct) * (1 + self.volatility * self.vol_multiplier * 100)
+        
+        target_bid = res_price - half_spread
+        target_ask = res_price + half_spread
+        
+        # 6. Исполнение ордеров (Quotations)
+        self._manage_quotes(engine, target_bid, target_ask, t)
+        
+        # Визуализация для отладки
+        self.plot.line("Mid", self.mid_price, t, color="gray", alpha=0.5)
+        self.plot.line("ResPrice", res_price, t, color="blue", alpha=0.8)
+        self.plot.line("TargetBid", target_bid, t, color="green", linestyle="dotted")
+        self.plot.line("TargetAsk", target_ask, t, color="red", linestyle="dotted")
 
+    def _manage_quotes(self, engine, target_bid, target_ask, t):
+        """Умная перестановка ордеров"""
+        
+        # --- BID LOGIC ---
+        # Если инвентарь переполнен лонгом, можем не ставить бид вообще (Risk Management)
+        should_buy = self.inventory < self.max_position
+        
+        if should_buy:
+            # Проверяем, нужно ли двигать ордер
+            if self.bid_oid is None:
+                self._place_bid(engine, target_bid)
+            else:
+                # Двигаем, только если цена ушла существенно (фильтр спама ордерами)
+                dist = abs(self.active_bid_price - target_bid) / target_bid
+                if dist > self.requote_threshold_pct:
+                    engine.cancel_order(self.bid_oid)
+                    self._place_bid(engine, target_bid)
+        elif self.bid_oid:
+             engine.cancel_order(self.bid_oid)
+             self.bid_oid = None
+
+        # --- ASK LOGIC ---
+        should_sell = self.inventory > -self.max_position
+        
+        if should_sell:
+            if self.ask_oid is None:
+                self._place_ask(engine, target_ask)
+            else:
+                dist = abs(self.active_ask_price - target_ask) / target_ask
+                if dist > self.requote_threshold_pct:
+                    engine.cancel_order(self.ask_oid)
+                    self._place_ask(engine, target_ask)
+        elif self.ask_oid:
+            engine.cancel_order(self.ask_oid)
+            self.ask_oid = None
+
+    def _place_bid(self, engine, price):
+        # Округляем цену (важно для биржи)
+        # В реальном коде тут нужен round_to_tick_size
+        qty = self.order_amount / price
         oid = engine.place_order("limit", price=price, size=qty)
         if oid:
-            self.active_orders[side] = oid
-            self.last_quote_prices[side] = price
+            self.bid_oid = oid
+            self.active_bid_price = price
 
-    def _cancel_order(self, engine, side: str):
-        oid = self.active_orders.get(side)
-        if oid is None:
-            return
+    def _place_ask(self, engine, price):
+        qty = self.order_amount / price
+        oid = engine.place_order("limit", price=price, size=-qty)
+        if oid:
+            self.ask_oid = oid
+            self.active_ask_price = price
 
-        o = self._find_order(engine, oid)
-        if o and o.status in ("new", "partially_filled"):
-            engine.cancel_order(oid)
-
-        self.active_orders.pop(side, None)
-
-    # ==================================================================
-    #  Вспомогательное
-    # ==================================================================
     def _get_position(self, engine):
+        # Кешируем позицию или ищем её
         for p in engine.positions:
-            if p.status == "open" and p.size != 0:
+            if p.status == "open":
                 return p
-        return None
-
-    def _find_order(self, engine, oid: int):
-        for o in engine.orders:
-            if o.id == oid:
-                return o
         return None

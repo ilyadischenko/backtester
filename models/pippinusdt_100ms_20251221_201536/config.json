@@ -1,0 +1,10 @@
+{
+  "exchange": "binance",
+  "symbol": "pippinusdt",
+  "horizon_ms": 100,
+  "threshold_bps": 2.0,
+  "lookback_ticks": 500,
+  "epochs": 50,
+  "batch_size": 512,
+  "learning_rate": 0.001
+}

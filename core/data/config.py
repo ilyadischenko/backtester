@@ -7,10 +7,10 @@ CLOUD_CONFIG = ""
 
 
 S3_CONFIG = {
-    "bucket": "data-collector-hft",
+    "bucket": "34bfe174605d-temp-hft-data",
     "prefix": "",
-    "endpoint_url": "https://storage.yandexcloud.net",
-    "aws_access_key_id": "YCAJEVJeIO1bNwwm7wm9o9by1",
-    "aws_secret_access_key": "YCNJ_6Frr8TWLFZxASFW47ZeYGFTtEawQaE0gwXa",
+    "endpoint_url": "https://s3.ru1.storage.beget.cloud",
+    "aws_access_key_id": "S2AX0NGD22Y0TR80SUJ9",
+    "aws_secret_access_key": "NWYz4HqBJ6PObIWe3sPbQi4GfwqCtMxKJxawYKYk",
     "aws_region": "ru-central1",
 }

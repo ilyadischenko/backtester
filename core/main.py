@@ -3,20 +3,25 @@
 import pstats
 import time
 
-from fast_iterator import run_fast
-
 # profiler = cProfile.Profile()
 # profiler.enable()
 
 
 from engine import ExchangeEngine
 # from strategies.test_strategy import  MarketMakerStrategy
-from strategies.knife_catcher import KnifeCatcherUltraFast
+# from strategies.knife_catcher import KnifeCatcherUltraFast
+# from strategies.mean_reversion import BollingerBandsStrategy
+# from strategies.test_strategy import AvellanedaStoikovMMSlope
+# from strategies.stoikov import HFTMarketMaker
+# from strategies.nn import MLStrategy
+# from strategies.channel import ChannelStrategy
+# from strategies.clusters import ClusterMeanReversionStrategy
+# from strategies.obImbalance import OrderflowImbalanceStrategy
+from strategies.frontrunning import FrontrunStrategy
 
-from strategies.test_strategy import AvellanedaStoikovMMNew
-from strategies.stoikov import AvellanedaStoikovMM
 
-from visualization import BacktestVisualizer
+
+from visualization.visualization import BacktestVisualizer
 
 # Твой data manager
 from data.data_manager import dataManager
@@ -29,26 +34,29 @@ from data.data_manager import dataManager
 # ═══════════════════════════════════════════════════════════
 df = dataManager.load_timerange(
     exchange="binance",
-    symbol="pieverseusdt",
-    start_time="2025-12-12 10:00",
-    end_time="2025-12-12 20:00",  # 2 часа для теста
+    symbol="sirenusdt",
+    start_time="2026-03-29 00:00:00",
+    end_time="2026-03-29 18:00:00",
     data_type="all",
-    market_type="futures"
+    market_type="futures",
 )
 
 
 def main():
     # Загружаем данные
-    bookticker = df.orderbook
-    trades = df.trades
+    # bookticker = df.orderbook
+    # trades = df.trades
 
-    strategy = AvellanedaStoikovMMNew(
-        # initial_balance=1000.0,
-        # order_size_usd=10.0,
-        # spread_bps=5.0,
-        # max_position_usd=500.0,
-        # refresh_interval_ms=1000,
+    strategy = FrontrunStrategy(
+        tick_size=0.001,
+        take_pct=0.5,
+        order_size=10.0
     )
+
+    # strategy = MLStrategy(
+    #     confidence_threshold=0.7,
+    #     model_path="models/pippinusdt_100ms_20251221_201102",
+    # )
 
     # strategy = KnifeCatcherUltraFast(
     #     # initial_balance  = 10000.0,
@@ -82,55 +90,46 @@ def main():
 
 
     engine = ExchangeEngine(
-        data_bookticker=bookticker,
-        data_trades=trades,
+        data_trades=df.trades,
+        data_depth=df.depth,
+        data_ob_snapshot=df.ob_snapshot,
         strategy=strategy,
         taker_fee=0.0004,
         maker_fee=0.0002,
-        network_delay=2
-
+        network_delay=2,
     )
 
     # Запускаем бэктест
     print("Running backtest...")
     # СТАЛО (быстро):
     t0 = time.time()
-    run_fast(engine)
+
+    import cProfile
+    import pstats
+
+    with cProfile.Profile() as pr:
+        engine.run()
+    stats = pstats.Stats(pr)
+    stats.sort_stats('cumulative')
+    stats.print_stats(20)  # топ 20 функций
     print(f"\nTime: {time.time() - t0:.2f}s")
     # ═══════════════════════════════════════════════════════════════
 
     # Результаты
     print(f"Net PnL: ${engine.get_net_pnl():,.2f}")
     # Визуализируем
-    viz = BacktestVisualizer(engine)
+    viz = BacktestVisualizer(engine, strategy=strategy)
     viz.show("My Backtest")
     print(len(engine.orders))
+    
+    
+    # val_pnl = engine.validate_pnl()
+    # print(f"Validation PnL: ${val_pnl}")
 
 
-    # print("\n" + "="*70)
-    # print("DETAILED POSITIONS:")
-    # print("="*70)
-    #
-    # for i, pos in enumerate(engine.positions, 1):
-    #     print(f"\n--- Position {i} (ID: {pos.id}) ---")
-    #     print(f"Status: {pos.status}")
-    #     print(f"Open time: {pos.open_time}")
-    #     print(f"Close time: {pos.close_time}")
-    #     print(f"Entry price: {pos.price:.5f}")
-    #     print(f"Size: {pos.size:.8f}")
-    #     print(f"Realized PnL (gross): ${pos.realized_pnl:.2f}")
-    #     print(f"Fees: ${pos.fees:.2f}")
-    #     print(f"Net PnL: ${pos.net_pnl:.2f}")
-    #     print(f"Orders in position: {len(pos.order_ids)}")
-    #
-    #     # Детали ордеров
-    #     print("\nOrders:")
-    #     for order_id in pos.order_ids:
-    #         order = next((o for o in engine.orders if o.id == order_id), None)
-    #         if order:
-    #             print(f"  - {order.type} | size: {order.size:+.8f} | "
-    #                 f"price: {order.fill_price:.5f} | "
-    #                 f"time: {order.fill_time}")
+    # positions_df = engine.positions_to_dataframe()
+    # print(positions_df)
+
 
 
 if __name__ == "__main__":

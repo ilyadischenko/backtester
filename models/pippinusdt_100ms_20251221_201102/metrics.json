@@ -1,0 +1,10 @@
+{
+  "test_accuracy": 46.14758491516113,
+  "best_val_accuracy": 53.72696433483084,
+  "config": {
+    "horizon_ms": 100,
+    "threshold_bps": 2.0,
+    "lookback_ticks": 50,
+    "input_dim": 17
+  }
+}
