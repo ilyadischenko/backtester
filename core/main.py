@@ -12,12 +12,12 @@ from engine import ExchangeEngine
 # from strategies.knife_catcher import KnifeCatcherUltraFast
 # from strategies.mean_reversion import BollingerBandsStrategy
 # from strategies.test_strategy import AvellanedaStoikovMMSlope
-# from strategies.stoikov import HFTMarketMaker
+from strategies.stoikov import AvellanedaStoikov
 # from strategies.nn import MLStrategy
 # from strategies.channel import ChannelStrategy
 # from strategies.clusters import ClusterMeanReversionStrategy
 # from strategies.obImbalance import OrderflowImbalanceStrategy
-from strategies.frontrunning import FrontrunStrategy
+# from strategies.frontrunning import FrontrunStrategy
 
 
 
@@ -34,9 +34,9 @@ from data.data_manager import dataManager
 # ═══════════════════════════════════════════════════════════
 df = dataManager.load_timerange(
     exchange="binance",
-    symbol="sirenusdt",
+    symbol="riverusdt",
     start_time="2026-03-29 00:00:00",
-    end_time="2026-03-29 18:00:00",
+    end_time="2026-04-01 18:00:00",
     data_type="all",
     market_type="futures",
 )
@@ -46,11 +46,15 @@ def main():
     # Загружаем данные
     # bookticker = df.orderbook
     # trades = df.trades
-
-    strategy = FrontrunStrategy(
-        tick_size=0.001,
-        take_pct=0.5,
-        order_size=10.0
+    strategy = AvellanedaStoikov(
+        risk_aversion=0.3,
+        order_amount=1.0,       # BTC за ордер
+        max_inventory=10.0,       # макс ±0.1 BTC
+        arrival_rate=1.5,        # заявок в сек — подбирается под символ
+        session_seconds=3600.0,
+        vol_window=200,
+        min_half_spread_pct=0.02,
+        imbalance_depth=10,
     )
 
     # strategy = MLStrategy(

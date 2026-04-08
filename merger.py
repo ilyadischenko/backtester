@@ -3,6 +3,8 @@
 Мерджер S3: находит файлы за указанный день и рынок,
 скачивает, мержит, дедуплицирует, загружает финальную версию.
 
+nohup python m.py > log.txt 2>&1 &
+
 Структура ключей в S3:
   {exchange}/{market}/{symbol}/{date}/{hour}_{datatype}_{serverID}.parquet
 
@@ -45,7 +47,7 @@ ACCESS_KEY = os.environ.get("S3_ACCESS_KEY", "S2AX0NGD22Y0TR80SUJ9")
 SECRET_KEY = os.environ.get("S3_SECRET_KEY", "NWYz4HqBJ6PObIWe3sPbQi4GfwqCtMxKJxawYKYk")
 EXCHANGE   = os.environ.get("S3_EXCHANGE",   "binance")
 MARKET     = os.environ.get("MERGE_MARKET",  "futures")
-DATE       = os.environ.get("MERGE_DATE",    "20260329")
+DATE       = os.environ.get("MERGE_DATE",    "20260402")
 DRY_RUN    = os.environ.get("DRY_RUN", "0") == "1"
 
 logging.basicConfig(
